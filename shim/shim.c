@@ -191,14 +191,14 @@ void secondary_main(uint64_t idx)
 		sec_probe[3] = r ? 1 : 0xdead;
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
-	smc(PSCI_CPU_OFF, 0, 0, 0);
+	/* Park here: the boot CPU only needs the report. Avoid CPU_OFF while
+	 * we are still probing whether the PSCI power-down path is sane. */
 }
 
 static void test_smp(void)
 {
 	stage = "smp";
 	int64_t ret1[NR_CPUS] = {0}, ret2[NR_CPUS] = {0};
-	uint8_t tried[NR_CPUS] = {0};
 	int retried = 0;
 
 	for (int i = 0; i < NR_CPUS; i++)
@@ -208,35 +208,25 @@ static void test_smp(void)
 	dc_ivac_range((uintptr_t)sec_mpidr, (uintptr_t)(sec_mpidr + NR_CPUS));
 	dc_ivac_range((uintptr_t)sec_probe, (uintptr_t)(sec_probe + 4));
 
-	/* The DTB CPU regs are 0x100..0x700; the full MPIDR adds bit31/MT. */
+	/* Boot CPU MPIDR is 0x81000000, so try the full target first. */
 	for (int i = 1; i < NR_CPUS; i++) {
-		ret1[i] = smc(PSCI_CPU_ON, (uint64_t)i << 8,
-			      (uintptr_t)secondary_entry, i);
+		uint64_t target = 0x81000000UL | ((uint64_t)i << 8);
+
+		con_hex2("SMP", "on=", (uint32_t)target, "cpu=", i);
+		ret1[i] = smc(PSCI_CPU_ON, target, (uintptr_t)secondary_entry, i);
+		con_hex2("SMP", "ret=", (uint32_t)ret1[i], "cpu=", i);
 		if (ret1[i] < 0) {
-			tried[i] = 1;
-			ret2[i] = smc(PSCI_CPU_ON, 0x81000000UL | ((uint64_t)i << 8),
+			ret2[i] = smc(PSCI_CPU_ON, (uint64_t)i << 8,
 				      (uintptr_t)secondary_entry, i);
+			con_hex2("SMP", "dtb=", (uint32_t)ret2[i], "cpu=", i);
 			retried = 1;
 		}
 	}
+	con_str("SMP", "waiting 400 ms");
 	delay_ms(400);
+	con_str("SMP", "waited");
 	dc_ivac_range((uintptr_t)sec_mpidr, (uintptr_t)(sec_mpidr + NR_CPUS));
 	dc_ivac_range((uintptr_t)sec_probe, (uintptr_t)(sec_probe + 4));
-
-	/* Target accepted but no secondary reported: retry with the full MPIDR. */
-	for (int i = 1; i < NR_CPUS; i++) {
-		if (!tried[i] && sec_mpidr[i] == 0) {
-			tried[i] = 1;
-			ret2[i] = smc(PSCI_CPU_ON, 0x81000000UL | ((uint64_t)i << 8),
-				      (uintptr_t)secondary_entry, i);
-			retried = 1;
-		}
-	}
-	if (retried) {
-		delay_ms(400);
-		dc_ivac_range((uintptr_t)sec_mpidr, (uintptr_t)(sec_mpidr + NR_CPUS));
-		dc_ivac_range((uintptr_t)sec_probe, (uintptr_t)(sec_probe + 4));
-	}
 
 	for (int i = 1; i < NR_CPUS; i++) {
 		char label[] = "CPU0";
@@ -249,6 +239,7 @@ static void test_smp(void)
 		 "probe1=", (uint32_t)sec_probe[1]);
 	con_hex2("SMP", "probe2=", (uint32_t)sec_probe[2],
 		 "probe3=", (uint32_t)sec_probe[3]);
+	(void)retried;
 }
 
 /* ---- GIC + timer ---- */
