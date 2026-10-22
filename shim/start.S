@@ -1,6 +1,8 @@
 /*
- * sweet boot shim entry: arm64 Linux Image header so Qualcomm ABL treats
- * us like a kernel. ABL enters at EL1, MMU/D-cache off, x0 = DTB pointer.
+ * Boot shim entry: arm64 Linux Image header so the bootloader treats us like
+ * a kernel. ABL (sweet) enters at EL1; MTK LK (fleur) may enter at EL1 or EL2.
+ * x0 = DTB pointer. Drop EL2 -> EL1 so the GIC/timer sysregs and XNU see the
+ * environment they expect.
  */
 	.section .text.head, "ax"
 	.globl _head
@@ -20,8 +22,25 @@ _head:
 	.globl _start
 _start:
 	msr	daifset, #0xf
-	mov	x19, x0			/* DTB pointer from ABL */
-	msr	spsel, #1
+	mov	x19, x0			/* DTB pointer from bootloader */
+	mrs	x20, currentel
+	lsr	x20, x20, #2		/* 1, 2 or 3 */
+
+	/* MTK LK can hand off at EL2; run the shim at EL1 like ABL does. */
+	cmp	x20, #2
+	b.ne	1f
+	mov	x0, #(1 << 31)		/* HCR_EL2.RW: EL1 is AArch64 */
+	msr	hcr_el2, x0
+	mov	x0, #3			/* CNTHCTL_EL2: EL1 counter/timer access */
+	msr	cnthctl_el2, x0
+	msr	cntvoff_el2, xzr
+	mov	x0, #0x3c5		/* SPSR_EL2: EL1h, DAIF masked */
+	msr	spsr_el2, x0
+	adr	x0, 1f
+	msr	elr_el2, x0
+	eret
+
+1:	msr	spsel, #1
 	adr	x1, _stack_top
 	mov	sp, x1
 	adr	x1, vectors
@@ -30,14 +49,15 @@ _start:
 	/* zero .bss */
 	adr	x1, _bss_start
 	adr	x2, _bss_end
-1:	cmp	x1, x2
-	b.hs	2f
+2:	cmp	x1, x2
+	b.hs	3f
 	str	xzr, [x1], #8
-	b	1b
-2:	mov	x0, x19
+	b	2b
+3:	mov	x0, x19
+	mov	x1, x20
 	bl	shim_main
-3:	wfe
-	b	3b
+4:	wfe
+	b	4b
 
 /* PSCI CPU_ON target. x0 = context id = cpu index (1..7). */
 	.globl secondary_entry

@@ -1,5 +1,57 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## FLEUR PORT (Redmi Note 11S, MT6781) - active 2026-10-22
+
+Goal: run the ios-sweet shim on fleur, then port XNU. Mu-Silicium work is paused;
+its state is in `../HANDOFF.md`. Work is on branch `fleur`; the sweet values are
+still in git history.
+
+Hardware constants, all from `../Mu-Silicium/Resources/DTBs/fleur.dts`:
+- Framebuffer `0x7C010000`, reserved `0x1DF0000`; panel 1080x2400; LK pitch
+  **assumed 1088 px (4352 B)** because 1088*2400*4*3 = 0x1DE3800 fits the
+  reserve (1080 gives 0x1DA9C00). Not yet verified on screen.
+- GICv3: GICD `0x0C000000` (0x40000), GICR `0x0C040000` (0x200000).
+- Timer: 13 MHz (`0xC65D40`); DT PPIs 13/14/11/10 -> INTIDs 29/30/27/26; the
+  shim uses virtual 27 and NS physical 30.
+- PSCI 1.0, `method = "smc"`; 8 cores (6x A55, 2x A75).
+- Storage: eMMC `11230000.mmc` and UFS `11270000.ufshci` (mt8183-ufshci). UFS
+  is still unimplemented (the shim's `ufs.c` is Qualcomm-only).
+- PMIC MT6358; no Qualcomm IMEM/PSHOLD. Reset uses PSCI SYSTEM_RESET.
+
+What changed on `fleur`:
+- `shim/console.h`, `shim/mmu.h`: fleur FB base/pitch.
+- `shim/start.S`: detects CurrentEL; drops EL2 -> EL1 (HCR_EL2.RW,
+  CNTHCTL_EL2=3, SPSR_EL2=0x3c5, eret) and passes the original EL to C.
+- `shim/shim.c`: fleur GIC/timer constants; Qualcomm reset path removed;
+  `shim_main` is now a **diagnostics-only** screen: draws a white border
+  (stride check) and prints boot/current EL, MIDR, MPIDR, DTB pointer+magic,
+  CNTFRQ, MMFR0, PFR0, SCTLR/TCR/TTBR0, FB geometry, PSCI version/features;
+  then halts. It does **not** touch UFS or enable the MMU.
+- `shim/build-fleur.sh`: builds the shim, gzips it with the stock-style stream
+  (`1f 8b 08 00 00 00 00 00 02 03`), and wraps it with `mkbootimg.py` exactly
+  like `Mu-fleur-white.img`: page 2048, base 0x40078000, kernel 0x40080000,
+  ramdisk 0x47c80000, tags/dtb 0x4bc80000, stock ramdisk,
+  `fleur_stock_dtbtable.bin`, cmdline
+  `bootopt=64S3,32N2,64N2 buildvariant=user`, header v2, os 12.0.
+
+Build: `cd shim && ./build-fleur.sh` -> `shim/out/shim-fleur.img` (19,845,120
+bytes, kernel gzip 6,879 B).
+Verified locally: header fields match the white image; gzip round-trips
+byte-for-byte to `out/Image`; ramdisk and DTB table are byte-identical to the
+stock assets; first instruction is `b _start` (entry at +0x800 because `.text`
+aligns 0x800 for the vectors).
+
+Next action (on-device, not yet run): phone in fastboot ->
+`fastboot boot shim/out/shim-fleur.img`. This is non-destructive if LK supports
+`fastboot boot`; if it fails with "unknown command"/not supported, flash to
+`boot_b` instead (current slot b) and restore from the stock boot.img afterwards.
+The image halts; recover with Power+VolDown -> fastboot. Report: screen color,
+border geometry (stride), all printed lines, and whether it hangs before drawing.
+
+Unknowns: fastboot boot support; whether LK passes a valid DTB in x0; actual fb
+pitch (4320 vs 4352); color order; whether LK accepts a raw kernel (we use gzip,
+proven by the white probe).
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

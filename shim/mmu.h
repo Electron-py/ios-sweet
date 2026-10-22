@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 
-#define FB_PHYS	0x9c000000UL
+#define FB_PHYS	0x7c010000UL	/* fleur framebuffer */
 
 struct mmu_info {
 	uint64_t img_lo, img_hi, ttbr;

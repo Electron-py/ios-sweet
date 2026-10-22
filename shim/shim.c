@@ -1,9 +1,8 @@
 /*
- * Milestone 2: one boot answers the questions that decide the XNU port.
- *   - CPU feature registers (16K granule, GIC sysreg interface)
- *   - PSCI/SMCCC version and which PSCI calls the Qualcomm TZ offers
- *   - SMP: PSCI CPU_ON for the 7 secondaries, each reports its MPIDR
- *   - GICv3 Group 1 IRQ from the virtual timer (INTID 19 on Qualcomm)
+ * Fleur (MT6781) bring-up shim.
+ *   - first image: prove the bootloader jumped to us, find the console and
+ *     report the CPU/exception environment (no MMIO except the framebuffer)
+ *   - later: MMU, PSCI/SMCCC, GICv3, MTK UFS, XNU payload
  * Any unexpected exception paints a blue panic screen.
  */
 #include <stdint.h>
@@ -12,13 +11,9 @@
 #include "loader.h"
 #include "ufs.h"
 
-#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
-#define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0c264000UL
-
-#define GICD_BASE		0x17a00000UL
-#define GICR_BASE		0x17a60000UL
-#define GICR_SIZE		0x100000UL
+#define GICD_BASE		0x0c000000UL	/* fleur gic: interrupt-controller@c000000 */
+#define GICR_BASE		0x0c040000UL	/* gic: ...@c040000 */
+#define GICR_SIZE		0x200000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
 #define GICR_WAKER		0x14
@@ -30,8 +25,8 @@
 #define GICR_ISPENDR0		(GICR_SGI + 0x200)
 #define GICR_ISACTIVER0		(GICR_SGI + 0x300)
 #define GICR_ICFGR1		(GICR_SGI + 0xc04)
-#define VTIMER_INTID		19	/* DT: <GIC_PPI 3 ...>, not the usual 27 */
-#define PTIMER_INTID		18	/* DT: <GIC_PPI 2 ...> */
+#define VTIMER_INTID		27	/* fleur DT PPI 11 + 16 (virtual timer) */
+#define PTIMER_INTID		30	/* fleur DT PPI 14 + 16 (NS physical timer) */
 #define SGI_INTID		1
 
 #define PSCI_VERSION		0x84000000UL
@@ -104,12 +99,10 @@ static void delay_ms(unsigned ms)
 static void __attribute__((noreturn)) reset(unsigned after_s)
 {
 	con_skip();
-	con_str("RESET", after_s > 20 ? "in 40s" : "in 20s");
+	con_str("RESET", "PSCI SYSTEM_RESET");
 	delay_ms(after_s * 1000);
-	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
-	__asm__ volatile("dsb sy" ::: "memory");
 	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
-	wr32(PSHOLD, 0);
+	con_str("RESET", "PSCI returned; halted");
 	for (;;)
 		__asm__ volatile("wfe");
 }
@@ -174,7 +167,7 @@ void secondary_main(uint64_t idx)
 			sec_probe[0] = rd32(r + GICR_IGROUPR0);
 			wr32(r + GICR_IGROUPR0, 0xffffffff);
 			sec_probe[1] = rd32(r + GICR_IGROUPR0);
-			wr8(r + GICR_IPRIORITYR + 19, 0xa0);
+			wr8(r + GICR_IPRIORITYR + VTIMER_INTID, 0xa0);
 			sec_probe[2] = rd32(r + GICR_IPRIORITYR + 16);
 		}
 		sec_probe[3] = r ? 1 : 0xdead;
@@ -278,7 +271,7 @@ static void irq_window(const char *label, uintptr_t r, int src)
 	con_hex2(" pre", "tctl=", ist, "last=", irq_last);
 }
 
-static void test_gic(void)
+static void __attribute__((unused)) test_gic(void)
 {
 	stage = "gic sre";
 	uint64_t sre = rsr("icc_sre_el1");
@@ -349,14 +342,14 @@ static void __attribute__((unused)) psci_line(const char *label, uint64_t fn)
 
 static uint64_t scratch[8192];	/* 64KB, lives in our (later cacheable) image */
 
-static uint64_t ticks_fill(uint32_t c)
+static uint64_t __attribute__((unused)) ticks_fill(uint32_t c)
 {
 	uint64_t t = now();
 	con_clear(c);
 	return now() - t;
 }
 
-static uint64_t ticks_mem(void)
+static uint64_t __attribute__((unused)) ticks_mem(void)
 {
 	uint64_t t = now();
 	for (int pass = 0; pass < 16; pass++)
@@ -365,71 +358,58 @@ static uint64_t ticks_mem(void)
 	return now() - t;
 }
 
-static uint32_t to_us(uint64_t ticks)
+static uint32_t __attribute__((unused)) to_us(uint64_t ticks)
 {
-	return ticks * 10 / 192;	/* 19.2 MHz */
+	uint64_t f = rsr("cntfrq_el0");
+	return f ? (uint32_t)(ticks * 1000000 / f) : 0;
 }
 
-void shim_main(uint64_t dtb)
+void shim_main(uint64_t dtb, uint64_t boot_el)
 {
-	struct mmu_info mi;
-
-	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
-	stage = "loader";
+	/*
+	 * Fleur milestone 1: touch nothing except the framebuffer. The border
+	 * makes a wrong stride obvious (the side lines shear), and every value
+	 * printed comes from a CPU register, so a hang here is unambiguous.
+	 */
+	stage = "diag";
 	con_clear(RED);
-	con_str("SHIM", "sweet milestone 4: xnu loader");
+
+	for (int x = 0; x < FB_W; x++) {
+		con_fb[x] = WHITE;
+		con_fb[(FB_H - 1) * (FB_STRIDE / 4) + x] = WHITE;
+	}
+	for (int y = 0; y < FB_H; y++) {
+		con_fb[y * (FB_STRIDE / 4)] = WHITE;
+		con_fb[y * (FB_STRIDE / 4) + FB_W - 1] = WHITE;
+	}
+
+	con_str("SHIM", "fleur MT6781 bring-up");
 	con_skip();
-	const char *why = loader_boot(dtb);
-	con_str("LOADER", why);
+	con_hex2("BOOT", "el=", (uint32_t)boot_el, "now=", (uint32_t)(rsr("currentel") >> 2));
+	con_hex2("MIDR", "lo=", (uint32_t)rsr("midr_el1"), "hi=", 0);
+	con_hex2("MPIDR", "lo=", (uint32_t)rsr("mpidr_el1"), "hi=", (uint32_t)(rsr("mpidr_el1") >> 32));
+	con_hex("DTB", dtb);
+	con_hex2("DTB", "magic=", dtb ? (uint32_t)__builtin_bswap32(rd32(dtb)) : 0,
+		 "ok=", dtb && __builtin_bswap32(rd32(dtb)) == 0xd00dfeed);
 	con_skip();
-
-	/* No payload: probe the internal UFS while the MMU is still off. */
-	stage = "ufs";
-	test_ufs();
-	con_skip();
-	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
-	con_str("UFS", "probe done, reset in ~3 min");
-	delay_ms(180000);
-	reset(20);
-
-	stage = "fill off";
-	uint64_t fill_off = ticks_fill(RED);
-	uint64_t mem_off = ticks_mem();
-
-	stage = "mmu enable";
-	int rc = mmu_enable(&mi);
-
-	stage = "fill on";
-	uint64_t fill_on = rc ? 0 : ticks_fill(RED);
-	uint64_t mem_on = rc ? 0 : ticks_mem();
-	if (rc)
-		con_clear(RED);
-
-	con_str("SHIM", "sweet milestone 3");
-	con_skip();
-	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
-	con_hex2("IMAGE", "lo=", mi.img_lo, "hi=", mi.img_hi);
-	con_hex2("MMU", "rc=", rc, "l3=", mi.n_l3);
-	con_hex2("TTBR0", "pa=", mi.ttbr, "pa_hi=", mi.ttbr >> 32);
-	con_hex("SCTLR0", mi.sctlr_before);
-	con_hex("SCTLR1", mi.sctlr_after);
+	con_hex("CNTFRQ", rsr("cntfrq_el0"));
+	con_hex("MMFR0", rsr("id_aa64mmfr0_el1"));
+	con_hex("PFR0", rsr("id_aa64pfr0_el1"));
+	con_hex("SCTLR", rsr("sctlr_el1"));
 	con_hex("TCR", rsr("tcr_el1"));
-	con_hex2("PARANGE", "mmfr0=", rsr("id_aa64mmfr0_el1") & 0xf, "tg16=", (rsr("id_aa64mmfr0_el1") >> 20) & 0xf);
+	con_hex("TTBR0", rsr("ttbr0_el1"));
 	con_skip();
-	con_hex("PAR img", mmu_probe((uintptr_t)shim_main));
-	con_hex("PAR fb", mmu_probe(FB_PHYS + 0x1000));
-	con_hex("PAR gic", mmu_probe(GICD_BASE));
-	con_hex("PAR 12G", mmu_probe(0x300000000UL));
+	con_hex2("FB", "base=", (uint32_t)FB_BASE, "stride=", FB_STRIDE);
+	con_hex2("FB", "w=", FB_W, "h=", FB_H);
 	con_skip();
-	con_hex2("FILL us", "off=", to_us(fill_off), "on=", to_us(fill_on));
-	con_hex2("MEM us", "off=", to_us(mem_off), "on=", to_us(mem_on));
+	con_hex2("PSCI", "ver=", (uint32_t)smc(PSCI_VERSION, 0, 0, 0),
+		 "smccc=", (uint32_t)smc(SMCCC_VERSION, 0, 0, 0));
+	con_hex2("PSCI", "reset=", (uint32_t)smc(PSCI_FEATURES, PSCI_SYSTEM_RESET, 0, 0),
+		 "on=", (uint32_t)smc(PSCI_FEATURES, PSCI_CPU_ON, 0, 0));
 	con_skip();
+	con_str("STATUS", "console alive; halted");
+	con_str("HALT", "hold power to reboot");
 
-	stage = "psci";
-	con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), "smccc=", smc(SMCCC_VERSION, 0, 0, 0));
-	con_skip();
-	test_gic();
-
-	stage = "done";
-	reset(40);
+	for (;;)
+		__asm__ volatile("wfe");
 }
