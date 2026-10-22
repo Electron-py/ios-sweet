@@ -59,6 +59,8 @@ static const char *stage;	/* set at runtime: no absolute pointers in data */
  * secondaries (MMU off, Device writes) have updated them. */
 static volatile uint64_t sec_mpidr[NR_CPUS] __attribute__((aligned(64)));
 static volatile uint64_t sec_probe[4] __attribute__((aligned(64)));
+static volatile uint64_t sec_any __attribute__((aligned(64)));
+static volatile uint64_t sec_ctx __attribute__((aligned(64)));
 static volatile uint32_t irq_count, irq_other, irq_last;
 static volatile int irq_src;
 
@@ -111,6 +113,16 @@ static void dc_ivac_range(uintptr_t start, uintptr_t end)
 
 	for (uintptr_t a = start & ~(line - 1); a < end; a += line)
 		__asm__ volatile("dc ivac, %0" : : "r"(a) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+/* Clean+invalidate: used by a secondary whose stores may be cacheable. */
+static void dc_civac_range(uintptr_t start, uintptr_t end)
+{
+	uint64_t line = 4UL << ((rsr("ctr_el0") >> 16) & 0xf);
+
+	for (uintptr_t a = start & ~(line - 1); a < end; a += line)
+		__asm__ volatile("dc civac, %0" : : "r"(a) : "memory");
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
@@ -176,9 +188,34 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 
 static uintptr_t find_gicr(void);
 
+/* Device write to the framebuffer: visible proof that a secondary ran. */
+static void sec_mark(void)
+{
+	volatile uint32_t *fb = (volatile uint32_t *)FB_BASE;
+
+	for (int y = 0; y < 16; y++)
+		for (int x = 0; x < 16; x++)
+			fb[(FB_H - 24 + y) * (FB_STRIDE / 4) +
+			   (FB_W - 24 + x)] = WHITE;
+}
+
 void secondary_main(uint64_t idx)
 {
-	sec_mpidr[idx] = rsr("mpidr_el1") | (1ULL << 63);
+	uint64_t mpidr = rsr("mpidr_el1");
+
+	/* Fixed heartbeat before anything that could fault or hang. */
+	sec_any = 0x5ec0de0000000000UL | (idx & 0xffff);
+	sec_ctx = idx;
+	if (idx < NR_CPUS)
+		sec_mpidr[idx] = mpidr | (1ULL << 63);
+	sec_mark();
+
+	/* PSCI should start us with the MMU off (Device stores), but clean to
+	 * PoC anyway in case this firmware leaves the secondary cacheable. */
+	dc_civac_range((uintptr_t)&sec_any, (uintptr_t)&sec_any + 8);
+	dc_civac_range((uintptr_t)&sec_ctx, (uintptr_t)&sec_ctx + 8);
+	dc_civac_range((uintptr_t)sec_mpidr, (uintptr_t)(sec_mpidr + NR_CPUS));
+
 	if (idx == 1) {
 		uintptr_t r = find_gicr();
 		if (r) {
@@ -189,6 +226,7 @@ void secondary_main(uint64_t idx)
 			sec_probe[2] = rd32(r + GICR_IPRIORITYR + 16);
 		}
 		sec_probe[3] = r ? 1 : 0xdead;
+		dc_civac_range((uintptr_t)sec_probe, (uintptr_t)(sec_probe + 4));
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
 	/* Park here: the boot CPU only needs the report. Avoid CPU_OFF while
@@ -199,14 +237,19 @@ static void test_smp(void)
 {
 	stage = "smp";
 	int64_t ret1[NR_CPUS] = {0}, ret2[NR_CPUS] = {0};
-	int retried = 0;
 
 	for (int i = 0; i < NR_CPUS; i++)
 		sec_mpidr[i] = 0;
 	for (int i = 0; i < 4; i++)
 		sec_probe[i] = 0;
+	sec_any = 0;
+	sec_ctx = 0;
 	dc_ivac_range((uintptr_t)sec_mpidr, (uintptr_t)(sec_mpidr + NR_CPUS));
 	dc_ivac_range((uintptr_t)sec_probe, (uintptr_t)(sec_probe + 4));
+	dc_ivac_range((uintptr_t)&sec_any, (uintptr_t)&sec_any + 8);
+	dc_ivac_range((uintptr_t)&sec_ctx, (uintptr_t)&sec_ctx + 8);
+
+	con_hex("ENTRY", (uint64_t)(uintptr_t)secondary_entry);
 
 	/* Boot CPU MPIDR is 0x81000000, so try the full target first. */
 	for (int i = 1; i < NR_CPUS; i++) {
@@ -219,27 +262,35 @@ static void test_smp(void)
 			ret2[i] = smc(PSCI_CPU_ON, (uint64_t)i << 8,
 				      (uintptr_t)secondary_entry, i);
 			con_hex2("SMP", "dtb=", (uint32_t)ret2[i], "cpu=", i);
-			retried = 1;
 		}
 	}
+	__asm__ volatile("sev" ::: "memory");
 	con_str("SMP", "waiting 400 ms");
 	delay_ms(400);
 	con_str("SMP", "waited");
 	dc_ivac_range((uintptr_t)sec_mpidr, (uintptr_t)(sec_mpidr + NR_CPUS));
 	dc_ivac_range((uintptr_t)sec_probe, (uintptr_t)(sec_probe + 4));
+	dc_ivac_range((uintptr_t)&sec_any, (uintptr_t)&sec_any + 8);
+	dc_ivac_range((uintptr_t)&sec_ctx, (uintptr_t)&sec_ctx + 8);
 
-	for (int i = 1; i < NR_CPUS; i++) {
+	con_hex2("SMP", "any=", (uint32_t)sec_any, "ctx=", (uint32_t)sec_ctx);
+	for (int i = 0; i < NR_CPUS; i++) {
 		char label[] = "CPU0";
-		label[3] = '0' + i;
-		con_hex2(label, "r1=", (uint32_t)ret1[i], "r2=", (uint32_t)ret2[i]);
+
+		if (i == 0)
+			label[0] = 'I';		/* IDX0, not the boot CPU */
+		else
+			label[3] = '0' + i;
 		con_hex2(label, "mpidr=", (uint32_t)sec_mpidr[i],
 			 "hi=", (uint32_t)(sec_mpidr[i] >> 32));
+		if (i)
+			con_hex2(label, "r1=", (uint32_t)ret1[i],
+				 "r2=", (uint32_t)ret2[i]);
 	}
 	con_hex2("SMP", "probe0=", (uint32_t)sec_probe[0],
 		 "probe1=", (uint32_t)sec_probe[1]);
 	con_hex2("SMP", "probe2=", (uint32_t)sec_probe[2],
 		 "probe3=", (uint32_t)sec_probe[3]);
-	(void)retried;
 }
 
 /* ---- GIC + timer ---- */
