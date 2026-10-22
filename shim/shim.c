@@ -219,15 +219,21 @@ void secondary_main(uint64_t ctx)
 	dc_civac_range((uintptr_t)sec_mpidr, (uintptr_t)(sec_mpidr + NR_CPUS));
 
 	if (idx == 1) {
-		uintptr_t r = find_gicr();
-		if (r) {
-			sec_probe[0] = rd32(r + GICR_IGROUPR0);
-			wr32(r + GICR_IGROUPR0, 0xffffffff);
-			sec_probe[1] = rd32(r + GICR_IGROUPR0);
-			wr8(r + GICR_IPRIORITYR + VTIMER_INTID, 0xa0);
-			sec_probe[2] = rd32(r + GICR_IPRIORITYR + 16);
+		/* Do not scan all frames here: a sleeping redistributor must be
+		 * woken via WAKER before its other registers are touched. */
+		uintptr_t r = GICR_BASE + idx * GICR_PE_SIZE;
+		uint32_t w = rd32(r + GICR_WAKER);
+
+		sec_probe[0] = w;
+		if (w & 2) {
+			wr32(r + GICR_WAKER, w & ~2U);
+			for (int i = 0; i < 100000 && (rd32(r + GICR_WAKER) & 4); i++)
+				;
 		}
-		sec_probe[3] = r ? 1 : 0xdead;
+		sec_probe[1] = rd32(r + GICR_WAKER);
+		sec_probe[2] = (uint32_t)(rd64(r + GICR_TYPER) >> 32);
+		wr32(r + GICR_IGROUPR0, 0xffffffff);
+		sec_probe[3] = 1;
 		dc_civac_range((uintptr_t)sec_probe, (uintptr_t)(sec_probe + 4));
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
