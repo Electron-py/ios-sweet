@@ -13,7 +13,7 @@
 #include "console.h"
 #include "ufs.h"
 
-#define UFS_BASE	0x01d84000UL	/* ufshc@1d84000, sweet live FDT */
+#define UFS_BASE	0x11270000UL	/* ufshci@11270000, fleur */
 
 #define REG_CAP		0x00
 #define REG_VER		0x08
