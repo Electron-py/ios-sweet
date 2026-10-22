@@ -20,8 +20,10 @@ Hardware constants, all from `../Mu-Silicium/Resources/DTBs/fleur.dts`:
 
 What changed on `fleur`:
 - `shim/console.h`, `shim/mmu.h`: fleur FB base/pitch.
-- `shim/start.S`: detects CurrentEL; drops EL2 -> EL1 (HCR_EL2.RW,
-  CNTHCTL_EL2=3, SPSR_EL2=0x3c5, eret) and passes the original EL to C.
+- `shim/start.S`: detects CurrentEL and passes it to C. The first image does
+  **not** drop EL2 -> EL1: changing the translation regime before the console
+  is proven would add an avoidable failure mode. The drop sequence is in
+  commit 5d8fb06; restore it after the first screen report.
 - `shim/shim.c`: fleur GIC/timer constants; Qualcomm reset path removed;
   `shim_main` is now a **diagnostics-only** screen: draws a white border
   (stride check) and prints boot/current EL, MIDR, MPIDR, DTB pointer+magic,

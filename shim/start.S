@@ -1,8 +1,9 @@
 /*
  * Boot shim entry: arm64 Linux Image header so the bootloader treats us like
  * a kernel. ABL (sweet) enters at EL1; MTK LK (fleur) may enter at EL1 or EL2.
- * x0 = DTB pointer. Drop EL2 -> EL1 so the GIC/timer sysregs and XNU see the
- * environment they expect.
+ * x0 = DTB pointer. The first fleur image only records CurrentEL: the EL2->EL1
+ * drop is deliberately deferred until the framebuffer console is proven in
+ * the exact environment LK hands off in.
  */
 	.section .text.head, "ax"
 	.globl _head
@@ -24,21 +25,7 @@ _start:
 	msr	daifset, #0xf
 	mov	x19, x0			/* DTB pointer from bootloader */
 	mrs	x20, currentel
-	lsr	x20, x20, #2		/* 1, 2 or 3 */
-
-	/* MTK LK can hand off at EL2; run the shim at EL1 like ABL does. */
-	cmp	x20, #2
-	b.ne	1f
-	mov	x0, #(1 << 31)		/* HCR_EL2.RW: EL1 is AArch64 */
-	msr	hcr_el2, x0
-	mov	x0, #3			/* CNTHCTL_EL2: EL1 counter/timer access */
-	msr	cnthctl_el2, x0
-	msr	cntvoff_el2, xzr
-	mov	x0, #0x3c5		/* SPSR_EL2: EL1h, DAIF masked */
-	msr	spsr_el2, x0
-	adr	x0, 1f
-	msr	elr_el2, x0
-	eret
+	lsr	x20, x20, #2		/* 1, 2 or 3; report it, do not drop yet */
 
 1:	msr	spsel, #1
 	adr	x1, _stack_top
