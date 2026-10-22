@@ -56,7 +56,8 @@ _start:
 4:	wfe
 	b	4b
 
-/* PSCI CPU_ON target. x0 = context id = cpu index (1..7). */
+/* PSCI CPU_ON target. x0 is the context id in theory, but this firmware
+ * passes 0; secondary_main derives its index from its own MPIDR. */
 	.globl secondary_entry
 secondary_entry:
 	msr	daifset, #0xf

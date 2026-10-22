@@ -199,13 +199,15 @@ static void sec_mark(void)
 			   (FB_W - 24 + x)] = WHITE;
 }
 
-void secondary_main(uint64_t idx)
+void secondary_main(uint64_t ctx)
 {
 	uint64_t mpidr = rsr("mpidr_el1");
+	uint64_t idx = (mpidr >> 8) & 0xff;	/* fleur DT regs are 0x100..0x700 */
 
-	/* Fixed heartbeat before anything that could fault or hang. */
-	sec_any = 0x5ec0de0000000000UL | (idx & 0xffff);
-	sec_ctx = idx;
+	/* Fixed heartbeat before anything that could fault or hang. The context
+	 * value from this firmware is unreliable (observed 0), so key on MPIDR. */
+	sec_any = 0x5ec0de0000000000UL | idx;
+	sec_ctx = ctx;
 	if (idx < NR_CPUS)
 		sec_mpidr[idx] = mpidr | (1ULL << 63);
 	sec_mark();
