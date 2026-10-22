@@ -55,8 +55,10 @@ static inline void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
 extern char secondary_entry[];
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
-static volatile uint64_t sec_mpidr[NR_CPUS];
-static volatile uint64_t sec_probe[4];	/* CPU1 redistributor write test */
+/* 64-byte aligned so the boot CPU can invalidate only these lines after the
+ * secondaries (MMU off, Device writes) have updated them. */
+static volatile uint64_t sec_mpidr[NR_CPUS] __attribute__((aligned(64)));
+static volatile uint64_t sec_probe[4] __attribute__((aligned(64)));
 static volatile uint32_t irq_count, irq_other, irq_last;
 static volatile int irq_src;
 
@@ -95,6 +97,21 @@ static void delay_ms(unsigned ms)
 	uint64_t end = now() + rsr("cntfrq_el0") / 1000 * ms;
 	while (now() < end)
 		;
+}
+
+/*
+ * Invalidate (do not clean) a VA range to PoC. The secondary cores run with
+ * the MMU off, so their stores are Device and bypass the boot CPU's D-cache;
+ * drop the boot CPU's clean copies before reading what they wrote. The shared
+ * lines are 64-byte aligned and never dirty.
+ */
+static void dc_ivac_range(uintptr_t start, uintptr_t end)
+{
+	uint64_t line = 4UL << ((rsr("ctr_el0") >> 16) & 0xf);
+
+	for (uintptr_t a = start & ~(line - 1); a < end; a += line)
+		__asm__ volatile("dc ivac, %0" : : "r"(a) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
 }
 
 static void __attribute__((noreturn)) reset(unsigned after_s)
@@ -177,24 +194,61 @@ void secondary_main(uint64_t idx)
 	smc(PSCI_CPU_OFF, 0, 0, 0);
 }
 
-static void __attribute__((unused)) test_smp(void)
+static void test_smp(void)
 {
 	stage = "smp";
-	uint64_t self = rsr("mpidr_el1") & 0xffffff;
-	int64_t ret[NR_CPUS];
+	int64_t ret1[NR_CPUS] = {0}, ret2[NR_CPUS] = {0};
+	uint8_t tried[NR_CPUS] = {0};
+	int retried = 0;
 
-	for (int i = 1; i < NR_CPUS; i++)
-		ret[i] = smc(PSCI_CPU_ON, (uint64_t)i << 8, (uintptr_t)secondary_entry, i);
-	delay_ms(500);
+	for (int i = 0; i < NR_CPUS; i++)
+		sec_mpidr[i] = 0;
+	for (int i = 0; i < 4; i++)
+		sec_probe[i] = 0;
+	dc_ivac_range((uintptr_t)sec_mpidr, (uintptr_t)(sec_mpidr + NR_CPUS));
+	dc_ivac_range((uintptr_t)sec_probe, (uintptr_t)(sec_probe + 4));
+
+	/* The DTB CPU regs are 0x100..0x700; the full MPIDR adds bit31/MT. */
+	for (int i = 1; i < NR_CPUS; i++) {
+		ret1[i] = smc(PSCI_CPU_ON, (uint64_t)i << 8,
+			      (uintptr_t)secondary_entry, i);
+		if (ret1[i] < 0) {
+			tried[i] = 1;
+			ret2[i] = smc(PSCI_CPU_ON, 0x81000000UL | ((uint64_t)i << 8),
+				      (uintptr_t)secondary_entry, i);
+			retried = 1;
+		}
+	}
+	delay_ms(400);
+	dc_ivac_range((uintptr_t)sec_mpidr, (uintptr_t)(sec_mpidr + NR_CPUS));
+	dc_ivac_range((uintptr_t)sec_probe, (uintptr_t)(sec_probe + 4));
+
+	/* Target accepted but no secondary reported: retry with the full MPIDR. */
+	for (int i = 1; i < NR_CPUS; i++) {
+		if (!tried[i] && sec_mpidr[i] == 0) {
+			tried[i] = 1;
+			ret2[i] = smc(PSCI_CPU_ON, 0x81000000UL | ((uint64_t)i << 8),
+				      (uintptr_t)secondary_entry, i);
+			retried = 1;
+		}
+	}
+	if (retried) {
+		delay_ms(400);
+		dc_ivac_range((uintptr_t)sec_mpidr, (uintptr_t)(sec_mpidr + NR_CPUS));
+		dc_ivac_range((uintptr_t)sec_probe, (uintptr_t)(sec_probe + 4));
+	}
+
 	for (int i = 1; i < NR_CPUS; i++) {
 		char label[] = "CPU0";
 		label[3] = '0' + i;
-		if (((uint64_t)i << 8) == self)
-			con_str(label, "is boot cpu");
-		else
-			con_hex2(label, "ret=", (uint32_t)ret[i], "mpidr=",
-				 (uint32_t)sec_mpidr[i] | (sec_mpidr[i] ? 0 : 0xdead0000));
+		con_hex2(label, "r1=", (uint32_t)ret1[i], "r2=", (uint32_t)ret2[i]);
+		con_hex2(label, "mpidr=", (uint32_t)sec_mpidr[i],
+			 "hi=", (uint32_t)(sec_mpidr[i] >> 32));
 	}
+	con_hex2("SMP", "probe0=", (uint32_t)sec_probe[0],
+		 "probe1=", (uint32_t)sec_probe[1]);
+	con_hex2("SMP", "probe2=", (uint32_t)sec_probe[2],
+		 "probe3=", (uint32_t)sec_probe[3]);
 }
 
 /* ---- GIC + timer ---- */
@@ -218,6 +272,44 @@ static void gicd_wait_rwp(void)
 {
 	for (int i = 0; i < 1000000 && (rd32(GICD_BASE) & (1U << 31)); i++)
 		;
+}
+
+/*
+ * Read-only GICv3 view. No GICD/GICR writes: if LK left the GIC in the secure
+ * state we still get its real values instead of silently writing to WI bits.
+ */
+static void gic_report(void)
+{
+	stage = "gic sre";
+	con_hex2("GIC", "sre=", (uint32_t)rsr("icc_sre_el1"),
+		 "pmr=", (uint32_t)rsr("icc_pmr_el1"));
+	con_hex2("GIC", "grp1=", (uint32_t)rsr("icc_igrpen1_el1"),
+		 "ctlr=", (uint32_t)rsr("icc_ctlr_el1"));
+
+	stage = "gic dist";
+	con_hex2("GICD", "ctlr=", rd32(GICD_BASE), "typer=", rd32(GICD_BASE + 0x4));
+	con_hex2("GICD", "iidr=", rd32(GICD_BASE + 0x8), "typer2=", rd32(GICD_BASE + 0xc));
+
+	stage = "gic redist";
+	uintptr_t r = find_gicr();
+	if (!r) {
+		con_str("GICR", "not found");
+		return;
+	}
+	con_hex2("GICR", "base=", (uint32_t)r, "waker=", rd32(r + GICR_WAKER));
+	con_hex("GICRT", rd64(r + GICR_TYPER));
+	con_hex2("GICR", "grp=", rd32(r + GICR_IGROUPR0),
+		 "en=", rd32(r + GICR_ISENABLER0));
+	con_hex2("GICR", "pri16=", rd32(r + GICR_IPRIORITYR + 16),
+		 "pri24=", rd32(r + GICR_IPRIORITYR + 24));
+
+	int n = 0;
+	for (uintptr_t off = 0; off + 0x18 <= GICR_SIZE; off += GICR_PE_SIZE) {
+		n++;
+		if (rd64(GICR_BASE + off + GICR_TYPER) & (1UL << 4))
+			break;
+	}
+	con_hex2("GICR", "count=", n, "size=", GICR_SIZE);
 }
 
 /* Run one interrupt source for ~300 ms and report what the GIC saw. */
@@ -495,6 +587,15 @@ void shim_main(uint64_t dtb, uint64_t boot_el)
 	} else {
 		mmu_report(&mi, dtb);
 	}
+
+	/* Milestone 3: read-only GICv3 view, then PSCI CPU_ON. */
+	con_clear(BLUE);
+	con_str("SHIM", "fleur GIC/SMP");
+	con_skip();
+	gic_report();
+	con_skip();
+	con_str("SMP", "starting CPU1..7 via CPU_ON");
+	test_smp();
 
 	con_skip();
 	con_str("STATUS", "console alive; halted");
