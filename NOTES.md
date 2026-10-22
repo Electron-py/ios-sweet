@@ -38,11 +38,11 @@ What changed on `fleur`:
 - `shim/start.S`: detects CurrentEL and passes it to C; disables the MTK
   toprgu WDT at entry. **LK hands off at EL1** (confirmed on device), so the
   EL2 -> EL1 drop in commit 5d8fb06 is not needed and stays out.
-- `shim/shim.c`: fleur GIC/timer constants; Qualcomm reset path removed;
-  `shim_main` is now a **diagnostics-only** screen: draws a white border
-  (stride check) and prints boot/current EL, MIDR, MPIDR, DTB pointer+magic,
+- `shim/shim.c`: fleur GIC/timer constants; Qualcomm reset path removed.
+  The screen first prints boot/current EL, MIDR, MPIDR, DTB pointer+magic,
   CNTFRQ, MMFR0, PFR0, SCTLR/TCR/TTBR0, FB geometry, PSCI version/features;
-  then halts. It does **not** touch UFS or enable the MMU.
+  it then parses the DTB, enables the 16K MMU, and prints the after-state and
+  translation probes. It does **not** touch UFS yet.
 - `shim/fdt.c`: generic `fdt_get`/`fdt_get_u64`/`fdt_get_str` by absolute
   path (the old code only read `/chosen`).
 - `shim/shim.c`: prints model, real `/memory` base/size, UFS/MPHY regs and the
@@ -57,8 +57,8 @@ What changed on `fleur`:
   `fleur_stock_dtbtable.bin`, cmdline
   `bootopt=64S3,32N2,64N2 buildvariant=user`, header v2, os 12.0.
 
-Build: `cd shim && ./build-fleur.sh` -> `shim/out/shim-fleur.img` (19,845,120
-bytes, kernel gzip 6,879 B).
+Build: `cd shim && ./build-fleur.sh` -> `shim/out/shim-fleur.img` (19,847,168
+bytes, kernel gzip 8,606 B, decompressed 225,280 B).
 Verified locally: header fields match the white image; gzip round-trips
 byte-for-byte to `out/Image`; ramdisk and DTB table are byte-identical to the
 stock assets; first instruction is `b _start` (entry at +0x800 because `.text`
@@ -91,38 +91,35 @@ On-device 2026-10-22 (first shim boot, user transcription):
 - The first build reset after ~30 s: LK leaves the MTK toprgu WDT armed.
   `4192b27` disables it at entry (`0x10007000 = 0x22000000`, same sequence as
   Mu-Silicium's fleur entry); the WDT-off image is flashed to `boot_b`.
-- The transcription came from the 20:49 first-build photo, so WDT-off screen
-  persistence is still unconfirmed; values are identical.
+- The first transcription came from the 20:49 first-build photo; the WDT-off
+  build was confirmed later (milestone 2 stayed up long enough to transcribe
+  the whole 43-line report).
 
-Milestone 2 image (`shim/out/shim-fleur.img`, kernel gzip 8,606 B, 225,280 B
-decompressed): adds the DTB report and the 16K MMU probe. Screen lines after
-the existing diagnostics:
-```
-MODEL    MT6781
-MEMBASE  <real base>       MEMSIZE <real size>
-UFSBASE  0000000011270000  UFSSIZE 0000000000002300
-UFSVCC   0000000000000067  MPHY    0000000011cc0000
-MMU      enabling 16K granule...
-SCTLRa   <sctlr after M=1>  TCRa <tcr>  TTBR0a <ttbr0>
-IMG      par=... pa=...
-FB       par=... pa=...
-DTB      par=... pa=...
-UFS      par=... pa=...
-GIC      par=... pa=...
-NONE     par=... fst=...   (0x2_00000000 should be a translation fault)
-MMU      console alive after translation
-```
-Next action: flash this image to `boot_b`, reboot, and transcribe from `MODEL`
-down. Success = `SCTLRa` has bit 0 set, IMG/FB/DTB/UFS/GIC `par` bit 0 clear
-with `pa` equal to the VA, NONE `fst` set, and the "console alive" line still
-rendered. Then GIC/SMP, then the MTK UFS host and MT6358 PMIC.
+On-device 2026-10-22 (milestone 2, `4eb4692`, MMU image):
+- LK patches `/memory` to **6 GB**: `0x40000000 + 0x1_80000000`.
+- UFS `0x11270000+0x2300`, `vcc-supply` phandle `0x67` (`ldo_vemc`);
+  UFS MPHY `0x11cc0000`.
+- **16K EL1 MMU works**: `SCTLRa=0x30D01805` (M/C/I = 1),
+  `TCRa=0x1_409CB51C` (T0SZ=28, TG0=16K, IPS=36), `TTBR0a=0x4008C000`.
+- `PAR_EL1`: IMG/FB/DTB/UFS/GIC all translate with PA == VA;
+  `0x2_00000000` faults with FST=6 (level-2 translation fault, expected).
+- Console still renders after the MMU is enabled; the WDT-off screen stayed
+  up long enough to transcribe the whole report.
+- `MMFR0` was transcribed as 15 digits again (`000000000101122`); the 16K
+  path works regardless.
+
+Next action: GICv3 read-only probe then PSCI CPU_ON SMP test. Print
+`ICC_SRE_EL1`, GICD_CTLR/TYPER/IIDR and the boot CPU's GICR TYPER/WAKER
+before writing anything. CPU_ON targets are the DTB CPU regs
+`0x100..0x700`; if they return 0 but no secondary reports, retry with
+`0x81000000 | reg`. Then the MTK UFS host and MT6358 PMIC.
 
 Recovery: Power+VolDown -> fastboot, then flash
 `../Mu-Silicium/stockboot.img` to `boot_b`. `fastboot boot` is unavailable.
 
-Unknowns: WDT-off persistence; exact MMFR0 digits (TGran16 appears set);
-whether the 16K identity map survives on fleur. Color order is confirmed BGRA
-(red bg / white text rendered correctly).
+Unknowns: exact `MMFR0` digits; whether the fleur GIC is accessible from the
+current security state; the real PSCI CPU_ON target encoding. Color order is
+confirmed BGRA (red bg / white text rendered correctly).
 
 ## Agent handoff / active work (2026-10-15, latest)
 
