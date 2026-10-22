@@ -8,22 +8,22 @@ still in git history.
 
 Hardware constants, all from `../Mu-Silicium/Resources/DTBs/fleur.dts`:
 - Framebuffer `0x7C010000`, reserved `0x1DF0000`; panel 1080x2400; LK pitch
-  **assumed 1088 px (4352 B)** because 1088*2400*4*3 = 0x1DE3800 fits the
-  reserve (1080 gives 0x1DA9C00). Not yet verified on screen.
+  **verified 1088 px / 4352 B** on screen (FB prints `stride=00001100`; text is
+  readable, so no shear). 1088*2400*4*3 = 0x1DE3800 fits the reserve.
 - GICv3: GICD `0x0C000000` (0x40000), GICR `0x0C040000` (0x200000).
 - Timer: 13 MHz (`0xC65D40`); DT PPIs 13/14/11/10 -> INTIDs 29/30/27/26; the
   shim uses virtual 27 and NS physical 30.
-- PSCI 1.0, `method = "smc"`; 8 cores (6x A55, 2x A75).
+- PSCI **1.1**, `method = "smc"`; 8 cores (6x A55, 2x A75). SYSTEM_RESET and
+  CPU_ON are supported (`PSCI_FEATURES` returns 0).
 - Storage: eMMC `11230000.mmc` and UFS `11270000.ufshci` (mt8183-ufshci). UFS
   is still unimplemented (the shim's `ufs.c` is Qualcomm-only).
 - PMIC MT6358; no Qualcomm IMEM/PSHOLD. Reset uses PSCI SYSTEM_RESET.
 
 What changed on `fleur`:
 - `shim/console.h`, `shim/mmu.h`: fleur FB base/pitch.
-- `shim/start.S`: detects CurrentEL and passes it to C. The first image does
-  **not** drop EL2 -> EL1: changing the translation regime before the console
-  is proven would add an avoidable failure mode. The drop sequence is in
-  commit 5d8fb06; restore it after the first screen report.
+- `shim/start.S`: detects CurrentEL and passes it to C; disables the MTK
+  toprgu WDT at entry. **LK hands off at EL1** (confirmed on device), so the
+  EL2 -> EL1 drop in commit 5d8fb06 is not needed and stays out.
 - `shim/shim.c`: fleur GIC/timer constants; Qualcomm reset path removed;
   `shim_main` is now a **diagnostics-only** screen: draws a white border
   (stride check) and prints boot/current EL, MIDR, MPIDR, DTB pointer+magic,
@@ -43,26 +43,45 @@ byte-for-byte to `out/Image`; ramdisk and DTB table are byte-identical to the
 stock assets; first instruction is `b _start` (entry at +0x800 because `.text`
 aligns 0x800 for the vectors).
 
-On-device 2026-10-22 (first shim boot):
+On-device 2026-10-22 (first shim boot, user transcription):
 - `fastboot boot` is **not supported** by fleur LK. Flashed
   `shim/out/shim-fleur.img` to `boot_b` (current slot b) and rebooted.
 - **The shim runs**: red background with readable white text on screen. This
   proves LK decompresses the gzip kernel and jumps to it at 0x40080000, that
   FB `0x7C010000` is right, and that the 4352-byte / 1088-px stride renders
-  correctly (text was readable, no shear reported).
-- The screen resets after ~30 s: LK leaves the MTK toprgu WDT armed. Next
-  build disables it at entry (`0x10007000 = 0x22000000`, the same sequence as
-  Mu-Silicium's fleur entry), so the diagnostics stay up long enough to read.
-- The actual diagnostic values (boot EL, DTB, CNTFRQ, PSCI) have **not** been
-  read yet; the next boot is for photographing them.
+  correctly (text is readable, no shear).
+- Confirmed values (screen title `SHIM fleur MT6781 bring-up`):
+  ```
+  BOOT    el=00000001 now=00000001   -> EL1; no EL2 drop needed
+  MIDR    411FD050                   -> Cortex-A55, boot CPU
+  MPIDR   81000000                   -> CPU0 (Aff0/1/2 = 0)
+  DTB     000000004BCB0000           -> LK's DTB = table base + 0x30000
+  DTB     magic=D00DFEED ok=1        -> valid FDT
+  CNTFRQ  0000000000C65D40           -> 13 MHz
+  MMFR0   000000000101122 (15 digits transcribed; likely ...00101122)
+  PFR0    0000000011112222           -> GIC system-register interface (1)
+  SCTLR   0000000030D00800           -> M=0, MMU off
+  TCR     0, TTBR0 0                 -> no translation tables
+  FB      base=7C010000 stride=1100  -> 4352 B / 1088 px
+  FB      w=438 h=960                -> 1080x2400
+  PSCI    ver=00010001 smccc=00010001 -> PSCI 1.1, SMCCC 1.1
+  PSCI    reset=0 on=0               -> SYSTEM_RESET + CPU_ON supported
+  ```
+- The first build reset after ~30 s: LK leaves the MTK toprgu WDT armed.
+  `4192b27` disables it at entry (`0x10007000 = 0x22000000`, same sequence as
+  Mu-Silicium's fleur entry); the WDT-off image is flashed to `boot_b`.
+- The transcription came from the 20:49 first-build photo, so WDT-off screen
+  persistence is still unconfirmed; values are identical.
 
-Next action: flash the WDT-off build to `boot_b`, reboot, and read the
-diagnostic lines. Recovery: Power+VolDown -> fastboot, then flash
-`../Mu-Silicium/stockboot.img` to `boot_b`. `fastboot boot` is unavailable.
+Next action: enable the fleur 16K EL1 MMU (`shim/mmu.c`) and print
+SCTLR/TCR/TTBR0 plus translation probes after enabling, keeping the console
+alive. Then GIC/SMP, then the MTK UFS host and MT6358 PMIC. Recovery:
+Power+VolDown -> fastboot, then flash `../Mu-Silicium/stockboot.img` to
+`boot_b`. `fastboot boot` is unavailable.
 
-Unknowns: fastboot boot support; whether LK passes a valid DTB in x0; actual fb
-pitch (4320 vs 4352); color order; whether LK accepts a raw kernel (we use gzip,
-proven by the white probe).
+Unknowns: WDT-off persistence; exact MMFR0 digits (TGran16 appears set);
+whether the 16K identity map survives on fleur; color order is BGRA (red bg /
+white text rendered correctly).
 
 ## Agent handoff / active work (2026-10-15, latest)
 
