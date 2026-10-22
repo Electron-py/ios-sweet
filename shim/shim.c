@@ -383,7 +383,7 @@ void shim_main(uint64_t dtb, uint64_t boot_el)
 		con_fb[y * (FB_STRIDE / 4) + FB_W - 1] = WHITE;
 	}
 
-	con_str("SHIM", "fleur MT6781 bring-up");
+	con_str("SHIM", "fleur bring-up (wdt off)");
 	con_skip();
 	con_hex2("BOOT", "el=", (uint32_t)boot_el, "now=", (uint32_t)(rsr("currentel") >> 2));
 	con_hex2("MIDR", "lo=", (uint32_t)rsr("midr_el1"), "hi=", 0);

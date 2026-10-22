@@ -43,12 +43,22 @@ byte-for-byte to `out/Image`; ramdisk and DTB table are byte-identical to the
 stock assets; first instruction is `b _start` (entry at +0x800 because `.text`
 aligns 0x800 for the vectors).
 
-Next action (on-device, not yet run): phone in fastboot ->
-`fastboot boot shim/out/shim-fleur.img`. This is non-destructive if LK supports
-`fastboot boot`; if it fails with "unknown command"/not supported, flash to
-`boot_b` instead (current slot b) and restore from the stock boot.img afterwards.
-The image halts; recover with Power+VolDown -> fastboot. Report: screen color,
-border geometry (stride), all printed lines, and whether it hangs before drawing.
+On-device 2026-10-22 (first shim boot):
+- `fastboot boot` is **not supported** by fleur LK. Flashed
+  `shim/out/shim-fleur.img` to `boot_b` (current slot b) and rebooted.
+- **The shim runs**: red background with readable white text on screen. This
+  proves LK decompresses the gzip kernel and jumps to it at 0x40080000, that
+  FB `0x7C010000` is right, and that the 4352-byte / 1088-px stride renders
+  correctly (text was readable, no shear reported).
+- The screen resets after ~30 s: LK leaves the MTK toprgu WDT armed. Next
+  build disables it at entry (`0x10007000 = 0x22000000`, the same sequence as
+  Mu-Silicium's fleur entry), so the diagnostics stay up long enough to read.
+- The actual diagnostic values (boot EL, DTB, CNTFRQ, PSCI) have **not** been
+  read yet; the next boot is for photographing them.
+
+Next action: flash the WDT-off build to `boot_b`, reboot, and read the
+diagnostic lines. Recovery: Power+VolDown -> fastboot, then flash
+`../Mu-Silicium/stockboot.img` to `boot_b`. `fastboot boot` is unavailable.
 
 Unknowns: fastboot boot support; whether LK passes a valid DTB in x0; actual fb
 pitch (4320 vs 4352); color order; whether LK accepts a raw kernel (we use gzip,

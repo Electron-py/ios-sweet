@@ -24,6 +24,16 @@ _head:
 _start:
 	msr	daifset, #0xf
 	mov	x19, x0			/* DTB pointer from bootloader */
+
+	/*
+	 * LK leaves the MTK toprgu watchdog armed (~30 s reset). Same sequence
+	 * the fleur Mu-Silicium entry uses: WDT_MODE = WDT_MODE_KEY (EN=0).
+	 */
+	movz	x0, #0x1000, lsl #16
+	movk	x0, #0x7000
+	mov	w1, #0x22000000
+	str	w1, [x0]
+
 	mrs	x20, currentel
 	lsr	x20, x20, #2		/* 1, 2 or 3; report it, do not drop yet */
 
