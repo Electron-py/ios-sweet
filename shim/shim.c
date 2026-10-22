@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include "console.h"
 #include "mmu.h"
+#include "fdt.h"
 #include "loader.h"
 #include "ufs.h"
 
@@ -364,6 +365,81 @@ static uint32_t __attribute__((unused)) to_us(uint64_t ticks)
 	return f ? (uint32_t)(ticks * 1000000 / f) : 0;
 }
 
+static uint64_t be64_bytes(const uint8_t *b)
+{
+	return (uint64_t)b[0] << 56 | (uint64_t)b[1] << 48 |
+	       (uint64_t)b[2] << 40 | (uint64_t)b[3] << 32 |
+	       (uint64_t)b[4] << 24 | (uint64_t)b[5] << 16 |
+	       (uint64_t)b[6] << 8 | b[7];
+}
+
+/* Report what LK actually left in the DTB (it patches /memory from DRAM). */
+static void dtb_report(uintptr_t dtb)
+{
+	uint8_t reg[16];
+	uint32_t len;
+
+	const char *model = fdt_get_str(dtb, "/", "model");
+	con_str("MODEL", model ? model : "(none)");
+
+	int mem_ok = fdt_get(dtb, "/memory", "reg", reg, sizeof reg, &len);
+	if (!mem_ok)
+		mem_ok = fdt_get(dtb, "/memory@40000000", "reg", reg, sizeof reg, &len);
+	if (mem_ok && len >= 16) {
+		con_hex("MEMBASE", be64_bytes(reg));
+		con_hex("MEMSIZE", be64_bytes(reg + 8));
+	} else {
+		con_str("MEM", "no /memory reg");
+	}
+
+	if (fdt_get(dtb, "/ufshci@11270000", "reg", reg, sizeof reg, &len) && len >= 16) {
+		con_hex("UFSBASE", be64_bytes(reg));
+		con_hex("UFSSIZE", be64_bytes(reg + 8));
+	} else {
+		con_str("UFS", "no /ufshci node");
+	}
+
+	uint64_t vcc;
+	if (fdt_get_u64(dtb, "/ufshci@11270000", "vcc-supply", &vcc))
+		con_hex("UFSVCC", vcc);
+
+	if (fdt_get(dtb, "/ufs_mphy@11cc0000", "reg", reg, sizeof reg, &len) && len >= 16)
+		con_hex("MPHY", be64_bytes(reg));
+}
+
+struct probe {
+	char name[5];		/* inline: no absolute pointer relocations */
+	uintptr_t va;
+};
+
+static void mmu_report(struct mmu_info *mi, uintptr_t dtb)
+{
+	static const struct probe probes[] = {
+		{ "IMG",  0x40080000UL },
+		{ "FB",   0x7c010000UL },
+		{ "DTB",  0x4bcb0000UL },
+		{ "UFS",  0x11270000UL },
+		{ "GIC",  0x0c000000UL },
+		{ "NONE", 0x200000000UL },
+	};
+
+	con_hex("SCTLRa", mi->sctlr_after);
+	con_hex("TCRa", rsr("tcr_el1"));
+	con_hex("TTBR0a", rsr("ttbr0_el1"));
+	(void)dtb;
+
+	for (unsigned i = 0; i < sizeof probes / sizeof probes[0]; i++) {
+		uint64_t par = mmu_probe(probes[i].va);
+		if (par & 1)
+			con_hex2(probes[i].name, "par=", (uint32_t)par,
+				 "fst=", (uint32_t)((par >> 1) & 0x3f));
+		else
+			con_hex2(probes[i].name, "par=", (uint32_t)par,
+				 "pa=", (uint32_t)(par & 0xfffffffff000ULL));
+	}
+	con_str("MMU", "console alive after translation");
+}
+
 void shim_main(uint64_t dtb, uint64_t boot_el)
 {
 	/*
@@ -383,7 +459,7 @@ void shim_main(uint64_t dtb, uint64_t boot_el)
 		con_fb[y * (FB_STRIDE / 4) + FB_W - 1] = WHITE;
 	}
 
-	con_str("SHIM", "fleur bring-up (wdt off)");
+	con_str("SHIM", "fleur bring-up (dtb+mmu)");
 	con_skip();
 	con_hex2("BOOT", "el=", (uint32_t)boot_el, "now=", (uint32_t)(rsr("currentel") >> 2));
 	con_hex2("MIDR", "lo=", (uint32_t)rsr("midr_el1"), "hi=", 0);
@@ -406,6 +482,20 @@ void shim_main(uint64_t dtb, uint64_t boot_el)
 		 "smccc=", (uint32_t)smc(SMCCC_VERSION, 0, 0, 0));
 	con_hex2("PSCI", "reset=", (uint32_t)smc(PSCI_FEATURES, PSCI_SYSTEM_RESET, 0, 0),
 		 "on=", (uint32_t)smc(PSCI_FEATURES, PSCI_CPU_ON, 0, 0));
+
+	con_skip();
+	dtb_report(dtb);
+
+	con_skip();
+	stage = "mmu";
+	con_str("MMU", "enabling 16K granule...");
+	struct mmu_info mi;
+	if (mmu_enable(&mi)) {
+		con_str("MMU", "FAILED: image spans >2 blocks");
+	} else {
+		mmu_report(&mi, dtb);
+	}
+
 	con_skip();
 	con_str("STATUS", "console alive; halted");
 	con_str("HALT", "hold power to reboot");

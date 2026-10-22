@@ -54,8 +54,11 @@
 
 extern char _head[], _end[];
 
-/* 1 L2 + up to 2 L3 tables, plus slack to align to 16K at runtime */
-static uint64_t pt_pool[4 * NENT] __attribute__((aligned(4096)));
+/*
+ * 1 L2 + up to 2 L3 tables (48K) plus slack for 16K runtime alignment.
+ * Five tables (80K) guarantees four usable tables after aligning `pool`.
+ */
+static uint64_t pt_pool[5 * NENT] __attribute__((aligned(16384)));
 
 static void dcache_inval_range(uintptr_t start, uintptr_t end)
 {

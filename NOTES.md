@@ -19,6 +19,20 @@ Hardware constants, all from `../Mu-Silicium/Resources/DTBs/fleur.dts`:
   is still unimplemented (the shim's `ufs.c` is Qualcomm-only).
 - PMIC MT6358; no Qualcomm IMEM/PSHOLD. Reset uses PSCI SYSTEM_RESET.
 
+DTB facts (stock `fleur_stock_dtbtable.bin` has a 0x40-byte MTK header then one
+FDT; LK copies that FDT to 0x4BCB0000 and patches `/memory`):
+- `/ufshci@11270000`: reg `0x11270000+0x2300`, SPI 289, clocks
+  `ufs0-clock/ufs2-unipro-clk/ufs2-mp-clk/ufs2-aes-clk`,
+  `vcc-supply = <&ldo_vemc>` (MT6358 LDO_VEMC). UFS MPHY `0x11cc0000+0xc000`.
+- `/pwrap@1000d000`: MT6358 PMIC wrapper; regulators incl. `ldo_vemc`.
+- `/model = "MT6781"`, `/compatible = "mediatek,MT6781"`.
+- CPU regs `0x0,0x100,...,0x700` (A55 0..5, A75 6..7),
+  `enable-method = "psci"`; PSCI CPU_ON targets are the MPIDR values
+  (`0x81000000 | reg`), to be verified on secondary cores.
+- The stock DTB says `/memory` = `0x40000000+0x3e605000` (1GB), while
+  `fleur.dts` says `0x40000000+0x1_80000000` (6GB). LK patches the on-device
+  DTB, so the shim now prints the real `/memory`.
+
 What changed on `fleur`:
 - `shim/console.h`, `shim/mmu.h`: fleur FB base/pitch.
 - `shim/start.S`: detects CurrentEL and passes it to C; disables the MTK
@@ -29,6 +43,13 @@ What changed on `fleur`:
   (stride check) and prints boot/current EL, MIDR, MPIDR, DTB pointer+magic,
   CNTFRQ, MMFR0, PFR0, SCTLR/TCR/TTBR0, FB geometry, PSCI version/features;
   then halts. It does **not** touch UFS or enable the MMU.
+- `shim/fdt.c`: generic `fdt_get`/`fdt_get_u64`/`fdt_get_str` by absolute
+  path (the old code only read `/chosen`).
+- `shim/shim.c`: prints model, real `/memory` base/size, UFS/MPHY regs and the
+  UFS vcc phandle; then enables the 16K MMU and prints `SCTLRa/TCRa/TTBR0a`
+  plus `PAR_EL1` for IMG/FB/DTB/UFS/GIC/NONE probes.
+- `shim/mmu.c`: page-table pool enlarged to five 16K tables (80KB) and
+  16K-aligned, fixing an overflow when runtime alignment wasted three tables.
 - `shim/build-fleur.sh`: builds the shim, gzips it with the stock-style stream
   (`1f 8b 08 00 00 00 00 00 02 03`), and wraps it with `mkbootimg.py` exactly
   like `Mu-fleur-white.img`: page 2048, base 0x40078000, kernel 0x40080000,
@@ -73,15 +94,35 @@ On-device 2026-10-22 (first shim boot, user transcription):
 - The transcription came from the 20:49 first-build photo, so WDT-off screen
   persistence is still unconfirmed; values are identical.
 
-Next action: enable the fleur 16K EL1 MMU (`shim/mmu.c`) and print
-SCTLR/TCR/TTBR0 plus translation probes after enabling, keeping the console
-alive. Then GIC/SMP, then the MTK UFS host and MT6358 PMIC. Recovery:
-Power+VolDown -> fastboot, then flash `../Mu-Silicium/stockboot.img` to
-`boot_b`. `fastboot boot` is unavailable.
+Milestone 2 image (`shim/out/shim-fleur.img`, kernel gzip 8,606 B, 225,280 B
+decompressed): adds the DTB report and the 16K MMU probe. Screen lines after
+the existing diagnostics:
+```
+MODEL    MT6781
+MEMBASE  <real base>       MEMSIZE <real size>
+UFSBASE  0000000011270000  UFSSIZE 0000000000002300
+UFSVCC   0000000000000067  MPHY    0000000011cc0000
+MMU      enabling 16K granule...
+SCTLRa   <sctlr after M=1>  TCRa <tcr>  TTBR0a <ttbr0>
+IMG      par=... pa=...
+FB       par=... pa=...
+DTB      par=... pa=...
+UFS      par=... pa=...
+GIC      par=... pa=...
+NONE     par=... fst=...   (0x2_00000000 should be a translation fault)
+MMU      console alive after translation
+```
+Next action: flash this image to `boot_b`, reboot, and transcribe from `MODEL`
+down. Success = `SCTLRa` has bit 0 set, IMG/FB/DTB/UFS/GIC `par` bit 0 clear
+with `pa` equal to the VA, NONE `fst` set, and the "console alive" line still
+rendered. Then GIC/SMP, then the MTK UFS host and MT6358 PMIC.
+
+Recovery: Power+VolDown -> fastboot, then flash
+`../Mu-Silicium/stockboot.img` to `boot_b`. `fastboot boot` is unavailable.
 
 Unknowns: WDT-off persistence; exact MMFR0 digits (TGran16 appears set);
-whether the 16K identity map survives on fleur; color order is BGRA (red bg /
-white text rendered correctly).
+whether the 16K identity map survives on fleur. Color order is confirmed BGRA
+(red bg / white text rendered correctly).
 
 ## Agent handoff / active work (2026-10-15, latest)
 
