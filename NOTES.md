@@ -552,3 +552,13 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
      cpu_init, before arm_vm_init.
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
+
+## On-device 2026-10-22 (milestone 3, GIC+SMP)
+- GICv3 healthy: `sre=1`, `GICD ctlr=0x12 typer=0x0079040F`, 8 redistributors present (`count=8`, `waker=0`), PPI priorities `0xA0`.
+- PSCI `CPU_ON` works with full MPIDR targets `0x81000100..0x81000700` (firmware passes context `0`; secondary index derived from MPIDR).
+- **All 7 secondaries online**: `CPU1`–`CPU7` report correct MPIDRs `0x81000100..0x81000700` with `hi=80000000`.
+- Firmware accepts our entry point at `0x40080b64`.
+- Direct FB write from secondaries confirmed (white corner marker worked earlier).
+
+## Blocked
+- **UFS host**: `shim/ufs.c` is Qualcomm-specific. On MT6781 the controller is at `0x11270000` but needs MTK-specific init + MT6358 PMIC (`ldo_vemc`, phandle 0x67) + clocks. Current attempt hangs before printing UFS registers. Need MTK UFSHCI driver (mt8183/mtk-ufshci style) or implement minimal init.
