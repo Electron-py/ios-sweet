@@ -704,12 +704,17 @@ The flashed 16 GiB image is writable and XNU mounts it.  Boot arguments:
   missing.
 
 **Flashing caveat (important)**: a full `fastboot flash userdata <simg>`
-writes ~16 GiB; the last sparse segment alone covers ~8.4 GiB of zero-fill,
-and under write pressure its write fails with `sparse image write failure`.
+writes ~16 GiB; the last sparse segment expands to several GiB of zero-fill
+(4.36 GiB for v2) and its write fails with `sparse image write failure`.
 The data is fine.  Rebuild that last segment from the `.simg`
 (`DONTCARE` prefix up to the segment's first block, then the original
-chunks) and flash it alone: it took 73 s and completed the partition.
-`-S 512M` cannot be used: fleur `max-download-size` is 128 MiB.
+chunks) and flash it alone: 40 s for v2, 73 s for the previous image.
+`tools/sparse-tail.py IMAGE.simg OUT.simg` does this reproducibly: it
+simulates libsparse's `sparse_file_resparse` (merging adjacent FILL blocks,
+the 1/8 split heuristic, 28-byte header + 56-byte overhead) to find the
+last segment's start block, then emits the `DONTCARE` prefix plus the
+original tail chunks.  `-S 512M` cannot be used: fleur
+`max-download-size` is 128 MiB.
 
 ## On-device 2026-10-23 (milestone 8, root rebuilt with cryptexes)
 
@@ -741,6 +746,41 @@ chunks) and flash it alone: it took 73 s and completed the partition.
 Next: flash the v2 `.simg` to `userdata`, boot, and chase the next
 launchd/daemon panic.
 
+## On-device 2026-10-23 (milestone 9, SpringBoard runs on fleur)
+
+- Flash: the full 93-segment flash again failed on segment 93
+  (`sparse image write failure`).  `tools/sparse-tail.py` rebuilt that tail
+  (DONTCARE over blocks 0..3051320 + the original chunks, 26 MB sparse,
+  4.36 GiB expanded) and writing it alone took 40 s.  The harness
+  reproduces libsparse's `sparse_file_resparse` exactly; the generated image
+  is byte-identical on rerun.
+- **Boot result: SpringBoard runs.**  The console shows icon services
+  (`STORE_LOOKUP ... com.apple.camera`), scene/UIWindow setup and AKS
+  traffic, then `CRASH SpringBoard reason ns 2 code 0x5` (SIGTRAP) and
+  `exec xpcproxy`; launchd relaunches it, so it is a crash loop, not a boot
+  failure.  This means launchd, the dyld shared cache, cryptexes and the
+  keybag from the v2 image all work on fleur.
+- The heap-text dump (patch 0051, `sweetscan` defaults to
+  `backboardd,SpringBoard`) floods ~492 `STR ...` lines per crash and hides
+  the `CRASH ... pc/lr/bt` lines (patch 0043).  Rebuilt the boot image from
+  the **live payload** (`/tmp/opencode/payload-fleur-live.bin`, extracted from
+  the flashed `shim-fleur.img`) with the same kernel/ADT and cmdline plus
+  `sweetscan=- sweetiolog=- sweetsample=-`; flashed as
+  `shim/out/shim-fleur-diag.img`.  `shim/out/payload-fleur-lun2.bin` on the
+  host does not match the payload that was actually booted; always patch the
+  extracted one.
+- `dlopen(.../ManagedConfiguration.framework/ManagedConfiguration)` fails at
+  runtime; check whether that framework binary made it into the v2 root
+  image before treating it as the crash cause.
+- Log extraction without filming: patch 0047 already mirrors the console to
+  the last 1025 blocks (4 MiB ring + header) of `userdata` every second.
+  fastboot 37's `fetch` **protocol** accepts a byte range
+  (`fetch:PARTITION:0xOFFSET:0xSIZE`), but its CLI only fetches whole
+  partitions.  Plan: a pyusb client (pyusb is installed) to fetch
+  `[partition_size - 0x401000, partition_size)`, gated on
+  `getvar max-fetch-size` being non-zero, then decode with
+  `tools/sweet-log.py`.
+
 ## Blocked
 - **Kernel builds**: `dipa-studio/ios-sweet` denies pushes and
   `workflow_dispatch` to the available GitHub account (403), so CI runs on the
@@ -750,10 +790,10 @@ launchd/daemon panic.
   on 2026-11-02; the workflow needs a newer image with an Xcode-15-compatible
   `iig`, or a queued run after the brownout.  The binary-patched kernel covers
   fleur meanwhile.
-- **iOS on fleur**: HFS+ mounts and launchd runs.  The v2 image now carries
-  the cryptexes, dyld shared cache and keybag; it is built but not flashed.
-  No IOMFB/touch/USB driver on fleur yet, so after launchd gets past
-  `libSystem` expect the kernel console (fbcon) rather than SpringBoard.
+- **iOS on fleur**: the v2 image is flashed; HFS+ mounts, launchd and
+  SpringBoard run, but SpringBoard SIGTRAPs and launchd relaunches it.  The
+  crash backtrace is the next thing to read.  No IOMFB/touch/USB driver on
+  fleur yet, so the only output is the kernel console (fbcon).
 - **Dedicated FLEUR machine config**: not needed to boot (SWEET + fleur ADT
   works), but cleaner for timer/topology defaults before upstreaming.
 - Full GPT map: only the first 32 entries fit the console; read the rest from
