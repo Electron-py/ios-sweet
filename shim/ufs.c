@@ -3,12 +3,12 @@
  *
  * Runs with the 16K EL1 MMU on and the image mapped cacheable, so the DMA
  * descriptors and buffers are cleaned before the doorbell and invalidated
- * after completion.  Enables the MT6781 UFS clock gates first (LK may gate
- * them at handoff, and a read of a gated block can wedge the interconnect),
- * dumps what LK left in the controller/MPHY, then - only if the host is
- * enabled and the link is up - takes over the transfer request list and
- * issues READ-ONLY SCSI commands.  Nothing is ever written to the device:
- * there is no SCSI WRITE in this file.
+ * after completion.  Makes sure the MT6781 UFS clock gates are enabled (note:
+ * these INFRA gates are inverted - writing SET disables a clock, CLR enables
+ * it, and the status bit reads 1 while gated), dumps what LK left in the
+ * controller/MPHY, then - only if the host is enabled and the link is up -
+ * takes over the transfer request list and issues READ-ONLY SCSI commands.
+ * Nothing is ever written to the device: there is no SCSI WRITE in this file.
  *
  * Register layout and descriptor formats: JEDEC UFSHCI (JESD223).
  */
@@ -38,16 +38,30 @@
  */
 #define INFRA_AO	0x10001000UL
 #define INFRA2_SET	(INFRA_AO + 0xa4)
+#define INFRA2_CLR	(INFRA_AO + 0xa8)
 #define INFRA2_STA	(INFRA_AO + 0xac)
 #define INFRA3_SET	(INFRA_AO + 0xc0)
+#define INFRA3_CLR	(INFRA_AO + 0xc4)
 #define INFRA3_STA	(INFRA_AO + 0xc8)
 
+/*
+ * Polarity, from clk-gate.c: INFRA gates use mtk_clk_gate_ops_setclr, whose
+ * is_enabled() is "status bit CLEARED".  Writing a 1 to SET *disables* the
+ * gate, writing a 1 to CLR enables it.  A status bit of 1 means "clock off".
+ */
+
 #define G_UNIPRO_SCK	(1u << 11)	/* 0x3e, "ufs0-unipro-clk" */
+#define G_UNIPRO_TICK	(1u << 12)	/* CLK_INFRA_UNIPRO_TICK, not in DT */
 #define G_MP_SAP_BCLK	(1u << 13)	/* 0x40, "ufs0-mp-clk" */
 #define G_AES_UFS	(1u << 29)	/* 0x75, "ufs0-aes-clk" */
 #define G_UFS		(1u << 30)	/* 0x4f, "ufs0-clock" */
 #define G_UFS_TICK	(1u << 31)	/* CLK_INFRA_UFS_TICK, not in DT */
 #define G_UFS_AXI	(1u << 5)	/* INFRA3, DMA path */
+
+/* infracfg_ao reset assert registers (ti,syscon-reset: BIT(index) set = held). */
+#define RST_HCI		0x10001130UL	/* bit 15 */
+#define RST_UNIPRO	0x10001140UL	/* bit 7 */
+#define RST_CRYPTO	0x10001150UL	/* bit 21 */
 
 /* MTK MPHY init bits (drivers/phy/mediatek/phy-mtk-ufs.c). */
 #define MP_GLB_DIG_8C	0x008c
@@ -77,7 +91,7 @@ static inline void ufs_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(UFS
 static inline uint32_t rd32a(uintptr_t a) { return *(volatile uint32_t *)a; }
 static inline void wr32a(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
 
-static void wait_ms(unsigned ms)
+static void __attribute__((unused)) wait_ms(unsigned ms)
 {
 	uint64_t frq, end;
 
@@ -119,24 +133,40 @@ static void dc_ivac(void *p, unsigned n)
 }
 
 /*
- * LK reads the boot image from this UFS, so it must leave the controller
- * clocked; but if it gates the gates at handoff, any read of 0x11270000 can
- * wedge the interconnect.  Enable the four DT clocks first (idempotent) and
- * report what LK left behind.
+ * LK reads the boot image from this UFS, so it normally leaves the controller
+ * clocked.  The INFRA gate status bits were observed clear (= clock on) at
+ * handoff.  Make sure they are on anyway: idempotent, and a read of a gated
+ * block wedges the interconnect.
  */
 static void ufs_clocks(void)
 {
 	uint32_t b2 = rd32a(INFRA2_STA), b3 = rd32a(INFRA3_STA);
 
 	con_hex2("CLK", "infra2=", b2, "infra3=", b3);
-	wr32a(INFRA2_SET, G_UFS | G_UNIPRO_SCK | G_MP_SAP_BCLK | G_AES_UFS | G_UFS_TICK);
-	wr32a(INFRA3_SET, G_UFS_AXI);
+	/* Enable = write 1 to CLR; the status bit then reads 0. */
+	wr32a(INFRA2_CLR, G_UFS | G_UFS_TICK | G_UNIPRO_SCK | G_UNIPRO_TICK |
+	    G_MP_SAP_BCLK | G_AES_UFS);
+	wr32a(INFRA3_CLR, G_UFS_AXI);
 	__asm__ volatile("dsb sy" ::: "memory");
-	con_hex2("CLK", "infra2a=", rd32a(INFRA2_STA), "infra3a=", rd32a(INFRA3_STA));
+	b2 = rd32a(INFRA2_STA);
+	b3 = rd32a(INFRA3_STA);
+	con_hex2("CLK", "infra2a=", b2, "infra3a=", b3);
+	if (b2 & (G_UFS | G_UNIPRO_SCK | G_MP_SAP_BCLK))
+		con_hex2("CLK", "still gated2=", b2 & (G_UFS | G_UNIPRO_SCK | G_MP_SAP_BCLK),
+		    "3=", b3 & G_UFS_AXI);
+}
+
+/* Are LK's UFS resets left asserted?  1 = held in reset. */
+static void __attribute__((unused)) ufs_reset_state(void)
+{
+	con_hex2("RST", "hci=", (rd32a(RST_HCI) >> 15) & 1,
+	    "unipro=", (rd32a(RST_UNIPRO) >> 7) & 1);
+	con_hex2("RST", "crypto=", (rd32a(RST_CRYPTO) >> 21) & 1,
+	    "130=", rd32a(RST_HCI) & 0x8000);
 }
 
 /* Read-only view of the MPHY: tells us whether LK left it powered. */
-static void mphy_report(void)
+static void __attribute__((unused)) mphy_report(void)
 {
 	uint32_t a = rd32a(MPHY_BASE + MP_GLB_DIG_8C);
 	uint32_t b = rd32a(MPHY_BASE + MP_LN_DIG_RX_9C);
@@ -313,12 +343,40 @@ static const char *fs_type(unsigned lun, uint32_t lba)
 	return "other";
 }
 
-/* One line per GPT entry of at least 64 MiB: name, first LBA, size in MiB (4K blocks). */
+/* Decode a GPT entry's UTF-16 name into ASCII (unknown chars become '?'). */
+static void part_name(const uint8_t *e, char *name)
+{
+	for (int c = 0; c < 16; c++) {
+		uint8_t ch = e[56 + 2 * c];
+		name[c] = (ch >= 32 && ch < 127) ? ch : (ch ? '?' : 0);
+	}
+	name[16] = 0;
+}
+
+/* One line: name, first LBA, size in MiB (4K blocks). */
+static void show_part(unsigned lun, const uint8_t *e, int detail)
+{
+	char name[17];
+	uint64_t first = le64(e + 32), last = le64(e + 40);
+	uint32_t mib = (uint32_t)((last - first + 1) >> 8);
+
+	part_name(e, name);
+	con_hex2(name, "lba=", (uint32_t)first, "MiB=", mib);
+	if (detail)
+		con_str("FS", fs_type(lun, (uint32_t)first));
+}
+
+/*
+ * userdata goes first and is always shown with its filesystem: it is where
+ * the iOS root will live.  The remaining entries fill what is left of the
+ * 49-row console; the full map can be read later from recovery if needed.
+ */
 static void list_partitions(unsigned lun, uint32_t entry_lba, uint32_t nent)
 {
 	static uint8_t ents[128 * 128] __attribute__((aligned(4096)));
 	uint32_t blocks = (nent * 128 + BLOCK - 1) / BLOCK;
 	unsigned shown = 0;
+	int have_ud = 0;
 
 	if (read_blocks(lun, entry_lba, blocks, ents)) {
 		con_str("PART", "read error");
@@ -326,25 +384,32 @@ static void list_partitions(unsigned lun, uint32_t entry_lba, uint32_t nent)
 	}
 	for (uint32_t i = 0; i < nent; i++) {
 		const uint8_t *e = ents + i * 128;
-		uint64_t first = le64(e + 32), last = le64(e + 40);
-		if (!first)
-			continue;
 		char name[17];
-		for (int c = 0; c < 16; c++) {
-			uint8_t ch = e[56 + 2 * c];
-			name[c] = (ch >= 32 && ch < 127) ? ch : (ch ? '?' : 0);
-		}
-		name[16] = 0;
-		uint32_t mib = (uint32_t)((last - first + 1) >> 8);
-		if (mib < 64)		/* keep the screen to the big ones */
+
+		if (!le64(e + 32))
 			continue;
-		if (shown++ >= 10) {
+		part_name(e, name);
+		if (same(name, "userdata")) {
+			show_part(lun, e, 1);
+			have_ud = 1;
+		}
+	}
+	if (!have_ud)
+		con_str("USERDATA", "not found");
+	for (uint32_t i = 0; i < nent; i++) {
+		const uint8_t *e = ents + i * 128;
+		char name[17];
+
+		if (!le64(e + 32))
+			continue;
+		part_name(e, name);
+		if (same(name, "userdata"))
+			continue;
+		if (shown++ >= 32) {
 			con_str("PART", "... more");
 			break;
 		}
-		con_hex2(name, "lba=", (uint32_t)first, "MiB=", mib);
-		if (same(name, "userdata") || same(name, "super"))
-			con_str(" fs", fs_type(lun, (uint32_t)first));
+		show_part(lun, e, 0);
 	}
 }
 
@@ -368,10 +433,12 @@ static int gpt_scan(unsigned lun)
 	uint32_t nent = gpt[80] | gpt[81] << 8 | gpt[82] << 16;
 	uint32_t esz = gpt[84] | gpt[85] << 8;
 	uint32_t elba = gpt[72] | gpt[73] << 8 | gpt[74] << 16 | gpt[75] << 24;
-	con_hex2("MBR", "sig=", data[510] | data[511] << 8, "lun=", lun);
-	con_str("GPT", sig);
+	if (!same(sig, "EFI PART")) {
+		con_hex2("GPT", "lun=", lun, "sig=", be32(gpt));
+		return -1;
+	}
 	con_hex2("GPT", "entries=", nent, "lba=", elba);
-	if (esz != 128 || !nent || nent > 128 || !same(sig, "EFI PART"))
+	if (esz != 128 || !nent || nent > 128)
 		return -1;
 	list_partitions(lun, elba, nent);
 	return 0;
@@ -386,19 +453,11 @@ void test_ufs(void)
 	 * its own screen.
 	 */
 	con_clear(BLUE);
-	con_str("SHIM", "fleur UFS probe (read-only)");
+	con_str("SHIM", "fleur UFS partition map (read-only)");
 	con_skip();
 
 	ufs_clocks();
-
-	/* Print first, then wait: if the first read wedges the bus, the last
-	 * visible line says exactly what we were about to do. */
 	con_skip();
-	con_str("UFS", "MPHY+HCI read in 1 s...");
-	wait_ms(1000);
-
-	mphy_report();
-	con_hex2("REF", "144=", ufs_rd(REG_REFCLK), "rsr=", ufs_rd(REG_UTRLRSR));
 
 	uint32_t ver = ufs_rd(REG_VER);
 	uint32_t cap = ufs_rd(REG_CAP);
@@ -406,13 +465,12 @@ void test_ufs(void)
 	uint32_t hcs = ufs_rd(REG_HCS);
 	con_hex2("UFS", "ver=", ver, "cap=", cap);
 	con_hex2("UFS", "hce=", hce, "hcs=", hcs);
-	con_hex2("UFS", "is=", ufs_rd(REG_IS), "rsr=", ufs_rd(REG_UTRLRSR));
-	con_hex2("UFS", "utrlba=", ufs_rd(REG_UTRLBA), "hi=", ufs_rd(REG_UTRLBAU));
-	con_hex2("UFS", "dbr=", ufs_rd(REG_UTRLDBR), "nutrs=", (cap & 0x1f) + 1);
-
+	if (ver == 0 || ver == 0xffffffffu) {
+		con_str("UFS", "no valid VER: not a real HCI read");
+		return;
+	}
 	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
-		con_str("UFS", "host not enabled/ready: stop");
-		con_str("NEXT", "clock/PHY were off; full re-init needed");
+		con_str("UFS", "host not enabled/link down: stop");
 		return;
 	}
 	if (ufs_rd(REG_UTRLDBR)) {
@@ -426,7 +484,6 @@ void test_ufs(void)
 	ufs_wr(REG_UTRLBA, (uint32_t)list);
 	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
 	ufs_wr(REG_UTRLRSR, 1);
-	con_hex2("UFS", "ours=", (uint32_t)list, "rsr=", ufs_rd(REG_UTRLRSR));
 	/*
 	 * Never ring a doorbell unless the host really uses our list: otherwise
 	 * it would execute whatever LK left in its own slot 0 (maybe a write).
@@ -439,20 +496,20 @@ void test_ufs(void)
 
 	static const uint8_t tur[6] = { 0x00 };
 	static const uint8_t cap10[10] = { 0x25 };	/* READ CAPACITY(10) */
-	unsigned gpt_lun = 0xffff;
 	int have_gpt = 0;
 
 	for (unsigned lun = 0; lun < 4; lun++) {
 		uint32_t ocs = 0, st = 0, rc = 1;
+		char ln[] = "LUN0";
+		ln[3] = '0' + lun;
 
 		/* A first command may report a unit attention; retry a few times. */
 		for (int i = 0; i < 3 && rc; i++)
 			rc = scsi(lun, tur, sizeof(tur), 0, 0, &ocs, &st);
-		char ln[] = "LUN0";
-		ln[3] = '0' + lun;
-		con_hex2(ln, "tur=", rc, "ocs/st=", ocs << 8 | st);
-		if (rc)
+		if (rc) {
+			con_hex2(ln, "tur=", rc, "ocs/st=", ocs << 8 | st);
 			continue;
+		}
 
 		ocs = st = 0;
 		rc = scsi(lun, cap10, sizeof(cap10), data, 8, &ocs, &st);
@@ -460,14 +517,14 @@ void test_ufs(void)
 			con_hex2("CAP", "lun=", lun, "rc=", rc);
 			continue;
 		}
-		con_hex2("CAP", "lastlba=", be32(data), "blk=", be32(data + 4));
+		con_hex2(ln, "lastlba=", be32(data), "blk=", be32(data + 4));
 		if (!have_gpt && gpt_scan(lun) == 0) {
 			have_gpt = 1;
-			gpt_lun = lun;
 		}
 	}
-	con_hex2("GPT", "found=", have_gpt, "lun=", gpt_lun);
+	if (!have_gpt)
+		con_str("GPT", "no GPT on any LUN");
 
 	con_skip();
-	con_str("STATUS", have_gpt ? "UFS read path works" : "no GPT found");
+	con_str("STATUS", "done");
 }

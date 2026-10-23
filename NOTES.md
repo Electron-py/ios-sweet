@@ -15,8 +15,9 @@ Hardware constants, all from `../Mu-Silicium/Resources/DTBs/fleur.dts`:
   shim uses virtual 27 and NS physical 30.
 - PSCI **1.1**, `method = "smc"`; 8 cores (6x A55, 2x A75). SYSTEM_RESET and
   CPU_ON are supported (`PSCI_FEATURES` returns 0).
-- Storage: eMMC `11230000.mmc` and UFS `11270000.ufshci` (mt8183-ufshci). UFS
-  is still unimplemented (the shim's `ufs.c` is Qualcomm-only).
+- Storage: eMMC `11230000.mmc` and UFS `11270000.ufshci` (mt8183-ufshci).
+  UFS is now **readable** from the shim (milestone 4, 2026-10-23); LK leaves
+  the link up, so no MTK re-init is needed for read-only access.
 - PMIC MT6358; no Qualcomm IMEM/PSHOLD. Reset uses PSCI SYSTEM_RESET.
 
 DTB facts (stock `fleur_stock_dtbtable.bin` has a 0x40-byte MTK header then one
@@ -57,8 +58,8 @@ What changed on `fleur`:
   `fleur_stock_dtbtable.bin`, cmdline
   `bootopt=64S3,32N2,64N2 buildvariant=user`, header v2, os 12.0.
 
-Build: `cd shim && ./build-fleur.sh` -> `shim/out/shim-fleur.img` (19,847,168
-bytes, kernel gzip 8,606 B, decompressed 225,280 B).
+Build: `cd shim && ./build-fleur.sh` -> `shim/out/shim-fleur.img` (19,849,216
+bytes with the UFS probe; kernel gzip 10,469 B, decompressed 225,280 B).
 Verified locally: header fields match the white image; gzip round-trips
 byte-for-byte to `out/Image`; ramdisk and DTB table are byte-identical to the
 stock assets; first instruction is `b _start` (entry at +0x800 because `.text`
@@ -108,11 +109,9 @@ On-device 2026-10-22 (milestone 2, `4eb4692`, MMU image):
 - `MMFR0` was transcribed as 15 digits again (`000000000101122`); the 16K
   path works regardless.
 
-Next action: GICv3 read-only probe then PSCI CPU_ON SMP test. Print
-`ICC_SRE_EL1`, GICD_CTLR/TYPER/IIDR and the boot CPU's GICR TYPER/WAKER
-before writing anything. CPU_ON targets are the DTB CPU regs
-`0x100..0x700`; if they return 0 but no secondary reports, retry with
-`0x81000000 | reg`. Then the MTK UFS host and MT6358 PMIC.
+Next action: milestone 3 (GIC+SMP) and milestone 4 (UFS read path) are done;
+see the later sections. Now start the XNU fleur port: machine config + ADT,
+then an MTK UFS root driver (read/write) using `shim/ufs.c` as reference.
 
 Recovery: Power+VolDown -> fastboot, then flash
 `../Mu-Silicium/stockboot.img` to `boot_b`. `fastboot boot` is unavailable.
@@ -560,5 +559,56 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - Firmware accepts our entry point at `0x40080b64`.
 - Direct FB write from secondaries confirmed (white corner marker worked earlier).
 
+## On-device 2026-10-23 (milestone 4, UFS read path + partition map)
+
+Root cause of every earlier UFS hang: the MTK INFRA gates are **set/clear
+polarity**, not enable bits. `mtk_clk_gate_ops_setclr`: write SET (`+0xa4`
+INFRA2, `+0xc0` INFRA3) to **disable** a clock, write CLR (`+0xa8` / `+0xc4`)
+to **enable**; the status bit reads 1 while gated. The shim was writing SET
+for "enable", turning every UFS clock off. LK's handoff state already has
+every UFS gate on, so the fix is: read the state, never write SET.
+
+LK handoff state (confirmed on device):
+- `infra2=0x00000001` (bits 11/12/13/29/30/31 clear = on; bit 0 belongs to
+  another gate), `infra3=0x00000180` (UFS_AXI bit 5 on).
+- All UFS resets deasserted (`hci`/`unipro`/`crypto` reset regs read 0).
+- MPHY PLL powered but CDR/RX squelch off (`0x8c=0x800`, `0x9c=0x0F030400`,
+  `0xac=0`, `0x44=0`); the link still works (auto-hibernate wakes it).
+
+UFS HCI at `0x11270000`, left enabled by LK:
+- `VER=0x00000310`, `CAP=0x1587071F` (32 TR slots, 8 task-mgmt slots).
+- `HCE=1`, `HCS=0x10F` -> DP + UTRLRDY + TMRLRDY + UCRDY: **link up, device
+  present**.
+- `IS=0`, `UTRLBA=0x4C692000` (LK's list), `UTRLDBR=0`.
+- MTK vendor `0x144` reads 3 (refclk domain alive).
+
+The shim stops UTRL, points `UTRLBA/U` at its own 16K-aligned list, sets
+`UTRLRSR=1`, verifies the base stuck, then issues polled SCSI TUR /
+READ CAPACITY(10) / READ(10) with a PRDT and 4K-aligned DMA. Buffers are
+Normal WB while MMIO is Device-nGnRnE, so every DMA is clean-before and
+invalidate-after.
+
+LUN map (`lastlba`, 4K blocks):
+- LUN0/LUN1: `0x3FF` (4 MiB each), sig `4D4D4D01` ("MMM"), MTK boot LUNs.
+- LUN2: `0x1DCAFFF` (127.97 GB), MBR `0xAA55`, GPT `EFI PART`,
+  **0x80 entries at LBA 2** -> main Android GPT LUN.
+- LUN3: absent (`TUR` rc 4, OCS/status 2).
+
+**`userdata`: LBA `0x2F7800`, byte offset `0x2F7800000`; last usable LBA
+`0x1DCAFFE`, 28,129,279 x 4K = 115,217,526,784 B = 107.30 GiB
+(`MiB=0x1AD37`); filesystem f2fs.**
+Other captured entries (screen truncated after 32; full map still to read):
+`misc`, `countrycode`, `para`, `expdb`, `gsort`, `ffu`, `cust`, `rescue`,
+`oem_misc1`, `frp`, `nvcfg`, `nvdata`, `ubmeta_{,system_,vendor_}{a,b}`,
+`md_udc`, `metadata`, `persist`, `protect1/2`, `seccfg`, `otp`, `md1img_a`,
+`spmfw_a`, `audio_dsp_a`, `pi_img_a`, `scp_a`, `sspm_a`, `gz_a`.
+
+Read-only: the shim has **no write path**. The iOS root image can be written
+into `userdata` from fastboot/recovery (destructive; confirm first).
+
 ## Blocked
-- **UFS host**: `shim/ufs.c` is Qualcomm-specific. On MT6781 the controller is at `0x11270000` but needs MTK-specific init + MT6358 PMIC (`ldo_vemc`, phandle 0x67) + clocks. Current attempt hangs before printing UFS registers. Need MTK UFSHCI driver (mt8183/mtk-ufshci style) or implement minimal init.
+- **XNU fleur port**: needs a fleur machine config + ADT, and an MTK UFS root
+  driver with read/write. `shim/ufs.c` is the reference for HCI/gate/PHY
+  sequencing; `userdata` (LUN2, LBA above) is the root target.
+- Full GPT map: only the first 32 entries fit the console; read the rest from
+  recovery later (not needed for the root partition).
