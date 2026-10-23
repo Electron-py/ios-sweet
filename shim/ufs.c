@@ -195,8 +195,10 @@ static void list_partitions(uint32_t entry_lba, uint32_t nent)
 void test_ufs(void)
 {
 	con_str("UFS", "milestone 5 probe (read-only)");
+	uint32_t ver = ufs_rd(REG_VER);
+	con_hex("UFSV", ver);
 	uint32_t cap = ufs_rd(REG_CAP), hcs = ufs_rd(REG_HCS), hce = ufs_rd(REG_HCE);
-	con_hex2("UFS", "ver=", ufs_rd(REG_VER), "cap=", cap);
+	con_hex2("UFS", "ver=", ver, "cap=", cap);
 	con_hex2("UFS", "hce=", hce, "hcs=", hcs);
 	con_hex2("UFS", "is=", ufs_rd(REG_IS), "rsr=", ufs_rd(REG_UTRLRSR));
 	con_hex2("UFS", "utrlba=", ufs_rd(REG_UTRLBA), "hi=", ufs_rd(REG_UTRLBAU));
