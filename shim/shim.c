@@ -576,6 +576,22 @@ static void mmu_report(struct mmu_info *mi, uintptr_t dtb)
 void shim_main(uint64_t dtb, uint64_t boot_el)
 {
 	/*
+	 * XNU mode: when LK's ramdisk is a SWEETXNU payload (tools/mkpayload.py,
+	 * passed with build-fleur.sh PAYLOAD), act as iBoot and jump to it with
+	 * the MMU and caches still off.  A diagnostic image's ramdisk is the
+	 * stock Android one, so this probe falls through to the bring-up report.
+	 */
+	if (loader_payload_present(dtb)) {
+		con_clear(BLUE);
+		con_str("SHIM", "booting SWEETXNU payload");
+		const char *err = loader_boot(dtb);
+		con_str("XNU", err);
+		con_str("HALT", "payload boot failed");
+		for (;;)
+			__asm__ volatile("wfe");
+	}
+
+	/*
 	 * Fleur milestone 1: touch nothing except the framebuffer. The border
 	 * makes a wrong stride obvious (the side lines shear), and every value
 	 * printed comes from a CPU register, so a hang here is unambiguous.

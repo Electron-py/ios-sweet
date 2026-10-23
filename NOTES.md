@@ -109,9 +109,9 @@ On-device 2026-10-22 (milestone 2, `4eb4692`, MMU image):
 - `MMFR0` was transcribed as 15 digits again (`000000000101122`); the 16K
   path works regardless.
 
-Next action: milestone 3 (GIC+SMP) and milestone 4 (UFS read path) are done;
-see the later sections. Now start the XNU fleur port: machine config + ADT,
-then an MTK UFS root driver (read/write) using `shim/ufs.c` as reference.
+Next action: milestone 5 booted XNU on fleur (no root only).  Now validate
+the UFS root driver on LUN 2 (`ufslun=2`, read-only), then write the iOS
+HFS+ image into `userdata` and boot it.  See the milestone sections below.
 
 Recovery: Power+VolDown -> fastboot, then flash
 `../Mu-Silicium/stockboot.img` to `boot_b`. `fastboot boot` is unavailable.
@@ -606,9 +606,47 @@ Other captured entries (screen truncated after 32; full map still to read):
 Read-only: the shim has **no write path**. The iOS root image can be written
 into `userdata` from fastboot/recovery (destructive; confirm first).
 
+## On-device 2026-10-23 (milestone 5, XNU boots on fleur)
+
+The `fleur` branch now boots the existing SWEET xnu on fleur.  The ADT is
+synthetic, so the SWEET kernel and drivers are reused **unchanged**: match
+strings stay `xiaomi,sweet` / `qcom,kryo470` / `qcom,ufshc`; only addresses and
+the timer INTID are fleur's.
+
+- `tools/mkadt.py --fleur`: RAM `0xC0000000 + 0xFFFFC000` (4 GiB - 16 KiB),
+  panic log carved from the top (`/pram` at `0x1BFEFC000`).  This leaves the
+  low 3 GiB to LK/ATF/modem/ADSP/SCP/SSPM and the framebuffer.  Every MTK
+  carve-out in the live DT is below `0xC0000000` except the last 4 KiB page
+  at `0x1BFFFF000`, which is outside the exposed range.
+- Same ADT: GICD `0x0C000000`, GICR `0x0C040000` (8 x `0x20000`),
+  virtual-timer INTID 27, CNTFRQ 13 MHz, fbcon `0x7C010000` 1080x2400
+  stride 4352, UFS `0x11270000`.  8 CPU nodes at MPIDRs `0x000..0x700`.
+- Shim: before the diagnostic path, if `/chosen/linux,initrd-start` holds a
+  `SWEETXNU` payload, call `loader_boot()` and jump with MMU/caches off.
+  `build-fleur.sh PAYLOAD` puts the payload in the ramdisk slot; with no
+  argument the stock ramdisk still runs the diagnostic report.
+- Payload: `tools/mkpayload.py xnu/out/kernel.development.sweet
+  shim/out/fleur-xnu.adt shim/out/payload-fleur.bin --cmdline "debug=0xc
+  serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0"`.
+- Image: `shim/out/shim-fleur.img` (16.7 MB) on `boot_b`.
+
+Result: **the kernel boots on fleur**, initializes zones/threads (48 threads)
+and panics only at the root device:
+`IOFindBSDRoot: specified root memory device, md0, has not been configured`
+(`IOKitBSDInit.cpp:826`) because no ramdisk image was supplied.  ADT identity
+works (`Device: D22`, `Hardware Model: iPhone10,3`, `iBoot version:
+sweet-shim`); KASLR slid the kernel to `0xfffffe40007004000`.  The panic log,
+zone map and 48-thread state all show normal XNU operation.
+
+Next: validate the UFS root driver on LUN 2 (`ufslun=2`, read-only), then
+write the iOS HFS+ image into `userdata` (destructive, confirm first) and boot
+`rd=ufsroot0 ufsroot=userdata ufslun=2 ufsrw=1 rootrw=1`.
+
 ## Blocked
-- **XNU fleur port**: needs a fleur machine config + ADT, and an MTK UFS root
-  driver with read/write. `shim/ufs.c` is the reference for HCI/gate/PHY
-  sequencing; `userdata` (LUN2, LBA above) is the root target.
+- **UFS root on fleur**: `sweet_ufs.c` hardcodes LUN 0 (sweet's GPT), while
+  fleur's GPT is LUN 2.  A late patch adds boot-arg `ufslun`; then the
+  `userdata` partition has to be replaced with the iOS HFS+ image.
+- **Dedicated FLEUR machine config**: not needed to boot (SWEET + fleur ADT
+  works), but cleaner for timer/topology defaults before upstreaming.
 - Full GPT map: only the first 32 entries fit the console; read the rest from
   recovery later (not needed for the root partition).

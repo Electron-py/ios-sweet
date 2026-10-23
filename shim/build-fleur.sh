@@ -7,6 +7,12 @@ cd "$(dirname "$0")"
 
 MUSI=${MUSI:-/home/tom/Documents/musi/Mu-Silicium}
 RAMDISK=${RAMDISK:-$MUSI/Resources/ramdisk}
+# Optional argument: an XNU payload (tools/mkpayload.py) to put in the ramdisk
+# slot.  The shim finds it via /chosen/linux,initrd-start and boots it; with no
+# argument the stock Android ramdisk is used and the diagnostic report runs.
+if [ $# -ge 1 ]; then
+	RAMDISK=$1
+fi
 DTB=${DTB:-$MUSI/Resources/DTBs/fleur_stock_dtbtable.bin}
 MKBOOTIMG=${MKBOOTIMG:-$MUSI/Resources/Scripts/mkbootimg.py}
 

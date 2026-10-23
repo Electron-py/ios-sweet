@@ -1,0 +1,19 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -590,9 +590,15 @@
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
+ 	if (!pn) {
+ 		return ENOMEM;
+ 	}
+ 	su.dma_pa = ptoa_64(pn);
+-	su.lun = 0;
++	/*
++	 * Fleur's Android GPT is LUN 2: LUN0 and LUN1 are the two 4 MiB MTK
++	 * boot LUNs.  Default 0 keeps the sweet behaviour.
++	 */
++	uint32_t ufslun = 0;
++	PE_parse_boot_argn("ufslun", &ufslun, sizeof(ufslun));
++	su.lun = (uint8_t)MIN(ufslun, 3);
+ 	su.secsize = DEV_BSIZE;
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
