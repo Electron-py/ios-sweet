@@ -638,8 +638,6 @@ void shim_main(uint64_t dtb, uint64_t boot_el)
 	con_str("SMP", "starting CPU1..7 via CPU_ON");
 	test_smp();
 	con_skip();
-	con_str("UFS", "probing");
-	test_ufs();
 	con_str("STATUS", "console alive; halted");
 	con_str("HALT", "hold power to reboot");
 
