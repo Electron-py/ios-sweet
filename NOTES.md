@@ -109,9 +109,10 @@ On-device 2026-10-22 (milestone 2, `4eb4692`, MMU image):
 - `MMFR0` was transcribed as 15 digits again (`000000000101122`); the 16K
   path works regardless.
 
-Next action: milestone 6 read the fleur GPT and `userdata` on LUN 2 with
-XNU's own UFS driver (read-only).  The iOS 16.7.16 root image was built from
-the iPhone X IPSW and is being flashed to `userdata`; then boot it writable.
+Next action: milestone 7 mounted the flashed root writable and started
+launchd, but the image (built by an older mkiosroot.sh) has no dyld shared
+cache/cryptexes, so launchd panics.  Rebuild it with
+`sudo tools/rebuild-fleur-root.sh`, verify the cache is inside, then reflash.
 See the milestone sections below.
 
 Recovery: Power+VolDown -> fastboot, then flash
@@ -676,9 +677,42 @@ here, so that image could not be reused):
   the rest of the partition (and the last 1025 blocks used by patch 0047)
   untouched.
 
-Next: boot the flashed image writable with `rd=ufsroot0 ufsroot=userdata
-ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1
-launchd_unsecure_cache=1 wdt=-1 wdt_test=no_user_checkin`.
+## On-device 2026-10-23 (milestone 7, HFS+ mounts, launchd starts)
+
+The flashed 16 GiB image is writable and XNU mounts it.  Boot arguments:
+
+    rd=ufsroot0 ufsroot=userdata ufsrw=1 rootrw=1
+    unentitled_ios_sim_launch=1 ignition_level=1
+    launchd_unsecure_cache=1 wdt=-1 wdt_test=no_user_checkin
+
+- HFS+ is accepted (the milestone-6 `unknown Volume Signature` is gone) and
+  launchd runs as pid 1.
+- Panic: `initproc failed to start ... Library not loaded:
+  /usr/lib/libSystem.B.dylib (no such file, no dyld cache)` followed by
+  `handshake structure not initialized`.  dyld cannot map the shared cache.
+- Cause (image inspection, not a guess): the image was produced by an
+  **older mkiosroot.sh** revision.  It contains
+  `private/var/db/diagnostics` but **no cryptexes**
+  (`private/preboot/Cryptexes` is empty), no
+  `System/Library/Caches/com.apple.dyld`, and no
+  `private/var/keybags/systembag.kb`.  The current `tools/mkiosroot.sh`
+  copies SystemOS/AppOS into the cryptex path, hard-links the shared cache
+  to `/System/Library/Caches/com.apple.dyld`, and installs the keybag.
+- Rebuild with `sudo tools/rebuild-fleur-root.sh`; it wraps
+  `mkiosroot.sh`, `fsck.hfsplus`, `sweet-root-tweaks.py`, another fsck and
+  `img2simg`, and refuses to finish if the cache, cryptexes or keybag are
+  missing.
+
+**Flashing caveat (important)**: a full `fastboot flash userdata <simg>`
+writes ~16 GiB; the last sparse segment alone covers ~8.4 GiB of zero-fill,
+and under write pressure its write fails with `sparse image write failure`.
+The data is fine.  Rebuild that last segment from the `.simg`
+(`DONTCARE` prefix up to the segment's first block, then the original
+chunks) and flash it alone: it took 73 s and completed the partition.
+`-S 512M` cannot be used: fleur `max-download-size` is 128 MiB.
+
+Next: run the rebuild, verify the cache in the new image, flash it, and boot
+again.  Then chase the next launchd/daemon panic.
 
 ## Blocked
 - **Kernel builds**: `dipa-studio/ios-sweet` denies pushes and
@@ -689,9 +723,11 @@ launchd_unsecure_cache=1 wdt=-1 wdt_test=no_user_checkin`.
   on 2026-11-02; the workflow needs a newer image with an Xcode-15-compatible
   `iig`, or a queued run after the brownout.  The binary-patched kernel covers
   fleur meanwhile.
-- **iOS on fleur**: the root image is built and flashed; booting it is the
-  next test.  No IOMFB/touch/USB driver on fleur yet, so expect the kernel
-  console (fbcon) rather than SpringBoard.
+- **iOS on fleur**: HFS+ mounts and launchd runs; the current image lacks
+  the dyld shared cache (built by an old mkiosroot.sh), so launchd panics
+  with `Library not loaded: /usr/lib/libSystem.B.dylib`.  Rebuild and reflash
+  the root.  No IOMFB/touch/USB driver on fleur yet, so after launchd gets
+  past this expect the kernel console (fbcon) rather than SpringBoard.
 - **Dedicated FLEUR machine config**: not needed to boot (SWEET + fleur ADT
   works), but cleaner for timer/topology defaults before upstreaming.
 - Full GPT map: only the first 32 entries fit the console; read the rest from
