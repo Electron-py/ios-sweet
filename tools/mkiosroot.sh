@@ -22,9 +22,15 @@ set -euo pipefail
 os=$(realpath "$1") sysos=$(realpath "$2") appos=$(realpath "$3") out=$4 size=${5:-16G}
 [[ ! -e $out ]] || { echo "refusing to overwrite $out" >&2; exit 1; }
 
+# apfs-fuse must know LZBITMAP (iOS 16 compresses most files with it).
+# Fedora's 2020 package (0-33) does not and returns EIO on ~3/4 of the OS
+# volume; sgan81/apfs-fuse from 2021 on does. Point APFS_FUSE at such a build.
+apfs_fuse=${APFS_FUSE:-$(command -v apfs-fuse || true)}
+
 # Pre-flight tool check
 missing_tools=()
-for tool in apfs-fuse mkfs.hfsplus rsync; do
+[[ -n $apfs_fuse ]] || missing_tools+=("apfs-fuse")
+for tool in mkfs.hfsplus rsync; do
 	command -v "$tool" >/dev/null 2>&1 || missing_tools+=("$tool")
 done
 
@@ -64,7 +70,7 @@ apfs_mount() {
 	ln -s "$1" "$work/$2.dmg"
 	mkdir "$work/$2"
 	# As root: a user's FUSE mount is unreadable to the root rsync below.
-	sudo "$(command -v apfs-fuse)" "$work/$2.dmg" "$work/$2"
+	sudo "$apfs_fuse" "$work/$2.dmg" "$work/$2"
 	mounts+=("$work/$2")
 }
 apfs_mount "$os" os
@@ -80,11 +86,65 @@ mounts=("$work/root" "${mounts[@]}")
 copy() {
 	echo "copying $1 -> ${2#"$work/root"}"
 	sudo mkdir -p "$2"
-	sudo rsync -aH --numeric-ids "$1/" "$2/"
+	# apfs-fuse 0.2 returns EIO on some inline/LZBITMAP files (the zoneinfo
+	# tree among them).  rsync keeps going and exits 23; recover those exact
+	# files from the DMG with 7z below.
+	set +e
+	sudo rsync -aH --numeric-ids "$1/" "$2/" 2> >(sudo tee -a "$work/rsync-failed.log" >&2)
+	local rc=$?
+	set -e
+	[[ $rc == 0 || $rc == 23 ]] || return "$rc"
 }
 copy "$work/os/root" "$work/root"
 copy "$work/sysos/root" "$work/root/private/preboot/Cryptexes/OS"
 copy "$work/appos/root" "$work/root/private/preboot/Cryptexes/App"
+
+# Fill the files apfs-fuse could not read. 7z decodes the same APFS image
+# without this bug; take uid/gid/mode from the (readable) source metadata.
+# One 7z run per DMG keeps the index parse (several seconds) amortised.
+if [[ -s $work/rsync-failed.log ]]; then
+	echo "== recovering files apfs-fuse could not read"
+	mkdir -p "$work/recover"
+	sed -n 's/.*send_files failed to open "\([^"]*\)".*/\1/p' "$work/rsync-failed.log" |
+		sort -u > "$work/failed.all"
+	: > "$work/failed.os"; : > "$work/failed.sysos"; : > "$work/failed.appos"
+	while IFS= read -r srcfile; do
+		case $srcfile in
+		"$work/os/root"/*)    echo "${srcfile#"$work/os/root"/}"    >> "$work/failed.os" ;;
+		"$work/sysos/root"/*) echo "${srcfile#"$work/sysos/root"/}" >> "$work/failed.sysos" ;;
+		"$work/appos/root"/*) echo "${srcfile#"$work/appos/root"/}" >> "$work/failed.appos" ;;
+		*) echo "  unknown source: $srcfile" >&2 ;;
+		esac
+	done < "$work/failed.all"
+
+	recover() { # LIST DMG SRCRoot DEST
+		[[ -s $1 ]] || return 0
+		local -a all
+		mapfile -t all < "$1"
+		local n=${#all[@]} i tmp=$work/recover/$(basename "$2" .dmg)
+		echo "  $(basename "$2"): $n files"
+		# One 7z command line holds at most ~2 MB, so batch the paths. A
+		# fresh temp dir per batch keeps tmpfs usage bounded.
+		for ((i = 0; i < n; i += 1500)); do
+			local -a chunk=("${all[@]:i:1500}")
+			rm -rf "$tmp"; mkdir -p "$tmp"
+			# 7z may return 2 for warnings (e.g. symlinks it refuses) while
+			# still extracting every wanted file; check each one below.
+			sudo 7z x -y -o"$tmp" "$2" -- "${chunk[@]}" >/dev/null || true
+			for rel in "${chunk[@]}"; do
+				[[ -f $tmp/$rel ]] || { echo "  FAILED to recover $rel" >&2; exit 1; }
+				read -r uid gid mode < <(sudo stat -c '%u %g %a' "$3/$rel")
+				sudo mkdir -p "$4/$(dirname "$rel")"
+				sudo install -o "$uid" -g "$gid" -m "$mode" "$tmp/$rel" "$4/$rel"
+			done
+			rm -rf "$tmp"
+		done
+		echo "  recovered $n files into ${4#"$work/root"}"
+	}
+	recover "$work/failed.os"    "$os"    "$work/os/root"    "$work/root"
+	recover "$work/failed.sysos" "$sysos" "$work/sysos/root" "$work/root/private/preboot/Cryptexes/OS"
+	recover "$work/failed.appos" "$appos" "$work/appos/root" "$work/root/private/preboot/Cryptexes/App"
+fi
 
 # Shared cache where dyld looks at ignition level 1: hard links, no extra space.
 dsc=private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld
@@ -132,4 +192,13 @@ sudo umount "$work/root"
 # Linux hfsplus decomposes some non-ASCII names (localized Shortcuts examples)
 # differently from Apple's tables; let fsck_hfs rewrite them, then verify.
 fsck.hfsplus -f -y "$out" | grep -v 'Illegal name' || true
-fsck.hfsplus -f -n "$out"
+# A clean -y can still be followed by a -n that wants to replay the journal
+# transaction fsck itself wrote; XNU replays that at mount, so not fatal.
+if ! fsck.hfsplus -f -n "$out"; then
+	if fsck.hfsplus -f -y "$out" >/dev/null; then
+		echo "warning: fsck -n still reports pending journal repairs; continuing" >&2
+	else
+		echo "error: HFS+ volume is corrupt after repair" >&2
+		exit 1
+	fi
+fi

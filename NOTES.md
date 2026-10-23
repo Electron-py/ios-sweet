@@ -711,8 +711,35 @@ The data is fine.  Rebuild that last segment from the `.simg`
 chunks) and flash it alone: it took 73 s and completed the partition.
 `-S 512M` cannot be used: fleur `max-download-size` is 128 MiB.
 
-Next: run the rebuild, verify the cache in the new image, flash it, and boot
-again.  Then chase the next launchd/daemon panic.
+## On-device 2026-10-23 (milestone 8, root rebuilt with cryptexes)
+
+- `tools/rebuild-fleur-root.sh` produced `ios16-root-20H392-v2.img` and
+  `.simg` (12 GiB sparse, simg sha256 `3d2b3299...c4800b39`).  Verified in
+  the image: `private/preboot/Cryptexes/{OS,App}`, the dyld cache
+  hard-linked to `System/Library/Caches/com.apple.dyld`, and
+  `private/var/keybags/systembag.kb`.
+- Host tooling gotcha: Fedora's `apfs-fuse-0-33.20200928git` predates
+  LZBITMAP and returns EIO on ~136k files of the OS volume (all of
+  zoneinfo, most of `usr/lib`, ...).  A current upstream build fixes it.
+  On Fedora 44 (CMake 4, GCC 16):
+      git clone --recurse-submodules https://github.com/sgan81/apfs-fuse
+      cmake -B build -S . -DUSE_FUSE3=ON \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_CXX_FLAGS="-include cstdint"
+      cmake --build build -j
+      sudo install -m755 build/apfs-fuse /usr/local/bin/apfs-fuse
+  `mkiosroot.sh` honors `APFS_FUSE`; the rebuild wrapper exports
+  `/usr/local/bin/apfs-fuse` when present.  Failures are still handled:
+  rsync exit 23 is tolerated and the failed files are recovered from the
+  DMG with 7z in 1500-path batches.
+- `fsck -n` right after a clean `fsck -y` can still say "Volume header needs
+  minor repair": that is fsck's own journal transaction, replayed by XNU on
+  mount.  `mkiosroot.sh` now only fails if a second `-y` cannot fix it.
+  `sudo RESUME=1 tools/rebuild-fleur-root.sh` reruns the
+  verify/tweaks/sparsify half on an existing `.img`.
+
+Next: flash the v2 `.simg` to `userdata`, boot, and chase the next
+launchd/daemon panic.
 
 ## Blocked
 - **Kernel builds**: `dipa-studio/ios-sweet` denies pushes and
@@ -723,11 +750,10 @@ again.  Then chase the next launchd/daemon panic.
   on 2026-11-02; the workflow needs a newer image with an Xcode-15-compatible
   `iig`, or a queued run after the brownout.  The binary-patched kernel covers
   fleur meanwhile.
-- **iOS on fleur**: HFS+ mounts and launchd runs; the current image lacks
-  the dyld shared cache (built by an old mkiosroot.sh), so launchd panics
-  with `Library not loaded: /usr/lib/libSystem.B.dylib`.  Rebuild and reflash
-  the root.  No IOMFB/touch/USB driver on fleur yet, so after launchd gets
-  past this expect the kernel console (fbcon) rather than SpringBoard.
+- **iOS on fleur**: HFS+ mounts and launchd runs.  The v2 image now carries
+  the cryptexes, dyld shared cache and keybag; it is built but not flashed.
+  No IOMFB/touch/USB driver on fleur yet, so after launchd gets past
+  `libSystem` expect the kernel console (fbcon) rather than SpringBoard.
 - **Dedicated FLEUR machine config**: not needed to boot (SWEET + fleur ADT
   works), but cleaner for timer/topology defaults before upstreaming.
 - Full GPT map: only the first 32 entries fit the console; read the rest from

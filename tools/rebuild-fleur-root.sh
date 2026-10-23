@@ -17,17 +17,26 @@ set -euo pipefail
 [[ $EUID == 0 ]] || { echo "run this with sudo" >&2; exit 1; }
 here=$(cd "$(dirname "$0")/.." && pwd)
 dl=/home/tom/Downloads/ipsw
+# Prefer a current apfs-fuse with LZBITMAP support over Fedora's 2020 build
+# (which returns EIO on most of the iOS 16 OS volume).
+[[ -x /usr/local/bin/apfs-fuse ]] && export APFS_FUSE=/usr/local/bin/apfs-fuse
 img=${1:-$dl/ios16-root-20H392-v2.img}
 [[ $img == *.img ]] || { echo "OUT must end in .img" >&2; exit 1; }
 simg=${img%.img}.simg
-[[ ! -e $img && ! -e $simg ]] || { echo "refusing to overwrite $img or $simg" >&2; exit 1; }
 for d in 087-86698-044 087-86593-047 087-86715-047; do
 	[[ -f $dl/$d.dmg ]] || { echo "missing $dl/$d.dmg" >&2; exit 1; }
 done
 
-"$here/tools/mkiosroot.sh" \
-	"$dl/087-86698-044.dmg" "$dl/087-86593-047.dmg" "$dl/087-86715-047.dmg" \
-	"$img" 16G
+[[ ! -e $simg ]] || { echo "refusing to overwrite $simg" >&2; exit 1; }
+if [[ ${RESUME:-0} == 1 ]]; then
+	# Finish an image whose mkiosroot run already completed the copy.
+	[[ -f $img ]] || { echo "RESUME=1 but $img does not exist" >&2; exit 1; }
+else
+	[[ ! -e $img ]] || { echo "refusing to overwrite $img" >&2; exit 1; }
+	"$here/tools/mkiosroot.sh" \
+		"$dl/087-86698-044.dmg" "$dl/087-86593-047.dmg" "$dl/087-86715-047.dmg" \
+		"$img" 16G
+fi
 
 echo "== checking the built image"
 fsck.hfsplus -fy "$img"
