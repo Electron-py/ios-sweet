@@ -637,8 +637,10 @@ void shim_main(uint64_t dtb, uint64_t boot_el)
 	con_skip();
 	con_str("SMP", "starting CPU1..7 via CPU_ON");
 	test_smp();
-	con_skip();
-	con_str("STATUS", "console alive; halted");
+
+	/* Milestone 4: UFS.  test_ufs() clears the screen: the SMP report
+	 * above fills all 49 visible rows and the console does not scroll. */
+	test_ufs();
 	con_str("HALT", "hold power to reboot");
 
 	for (;;)
