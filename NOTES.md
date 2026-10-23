@@ -109,9 +109,10 @@ On-device 2026-10-22 (milestone 2, `4eb4692`, MMU image):
 - `MMFR0` was transcribed as 15 digits again (`000000000101122`); the 16K
   path works regardless.
 
-Next action: milestone 5 booted XNU on fleur (no root only).  Now validate
-the UFS root driver on LUN 2 (`ufslun=2`, read-only), then write the iOS
-HFS+ image into `userdata` and boot it.  See the milestone sections below.
+Next action: milestone 6 read the fleur GPT and `userdata` on LUN 2 with
+XNU's own UFS driver (read-only).  The iOS 16.7.16 root image was built from
+the iPhone X IPSW and is being flashed to `userdata`; then boot it writable.
+See the milestone sections below.
 
 Recovery: Power+VolDown -> fastboot, then flash
 `../Mu-Silicium/stockboot.img` to `boot_b`. `fastboot boot` is unavailable.
@@ -638,14 +639,59 @@ works (`Device: D22`, `Hardware Model: iPhone10,3`, `iBoot version:
 sweet-shim`); KASLR slid the kernel to `0xfffffe40007004000`.  The panic log,
 zone map and 48-thread state all show normal XNU operation.
 
-Next: validate the UFS root driver on LUN 2 (`ufslun=2`, read-only), then
-write the iOS HFS+ image into `userdata` (destructive, confirm first) and boot
-`rd=ufsroot0 ufsroot=userdata ufslun=2 ufsrw=1 rootrw=1`.
+## On-device 2026-10-23 (milestone 6, XNU reads the userdata GPT on LUN 2)
+
+Read-only validation first (no writes to `userdata`):
+
+- Patch `0082` adds the `ufslun` boot arg, but the CI build could not run:
+  2026-10-23 is a macOS-14 brownout (14:00-24:00 UTC; the label retires on
+  2026-11-02).  The workflow job sat queued for 15 minutes, then failed.
+- Workaround: `tools/patch-fleur-ufslun.py` rewrites four instructions in
+  `_sweet_ufs_rootdev` of the existing 0081 kernel (found by byte pattern,
+  not a fixed offset): `mov w9,#2; stp x8,x9,[x21,#0x10]; mov w8,#0x200;
+  str w8,[x21,#0x30]` sets `su.lun = 2` while keeping the `dma_pa` and
+  `secsize` stores.  Same effect as 0082, without boot-arg parsing.
+- Boot args: `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam
+  -noprogress rd=ufsroot0 ufsroot=userdata` (no `ufsrw`: read-only).
+- On screen: `BSD root: ufsroot0, major 1, minor 0`, then
+  `fs_vnops_VfsValidateHFSPlusVolumeHeader: unknown Volume Signature : 1828`
+  twice, `hfs_mount: hfs_mountfs returned error=-22`, `cannot mount root,
+  errno = 19`, then the root panic.  The HFS+ rejection is expected (the
+  partition is still Android f2fs) and proves the read path: XNU's own UFS
+  driver found the GPT and the `userdata` entry on LUN 2.
+
+Root image built on this machine (the old `/run/media/dipa` SSD does not exist
+here, so that image could not be reused):
+
+- IPSW: iPhone10,3 iOS 16.7.16 **20H392**, 6.17 GB from `updates.cdn-apple.com`
+  (kept in `~/Downloads/ipsw`, never in git).
+- `tools/mkiosroot.sh` (OS 087-86698-044, SystemOS 087-86593-047, AppOS
+  087-86715-047), `fsck.hfsplus -fy`, `sweet-root-tweaks.py`, `img2simg`:
+  16.0 GiB HFS+ -> 7.7 GB sparse (`0xed26ff3a`, 24836 chunks).
+  SHA256 img `a15ce34a...c2dc9dd`, simg `46cbd822...fd1e8b6`.
+- **Fleur fastboot limit**: `max-download-size` is `0x8000000` (128 MiB).
+  `fastboot -S 512M flash userdata ...` fails at once with `data is too
+  large`; flash the `.simg` **without `-S`** so fastboot splits to 128 MiB.
+- Flash target: `userdata`, 107.3 GiB, LUN 2; the 16 GiB filesystem leaves
+  the rest of the partition (and the last 1025 blocks used by patch 0047)
+  untouched.
+
+Next: boot the flashed image writable with `rd=ufsroot0 ufsroot=userdata
+ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1
+launchd_unsecure_cache=1 wdt=-1 wdt_test=no_user_checkin`.
 
 ## Blocked
-- **UFS root on fleur**: `sweet_ufs.c` hardcodes LUN 0 (sweet's GPT), while
-  fleur's GPT is LUN 2.  A late patch adds boot-arg `ufslun`; then the
-  `userdata` partition has to be replaced with the iOS HFS+ image.
+- **Kernel builds**: `dipa-studio/ios-sweet` denies pushes and
+  `workflow_dispatch` to the available GitHub account (403), so CI runs on the
+  fork `Electron-py/ios-sweet` (`git remote fork`, push `fleur`, then
+  `gh workflow run xnu.yml -R Electron-py/ios-sweet --ref fleur`).  The
+  `macos-14` runner is in its 2026-10-23 brownout until 00:00 UTC and retires
+  on 2026-11-02; the workflow needs a newer image with an Xcode-15-compatible
+  `iig`, or a queued run after the brownout.  The binary-patched kernel covers
+  fleur meanwhile.
+- **iOS on fleur**: the root image is built and flashed; booting it is the
+  next test.  No IOMFB/touch/USB driver on fleur yet, so expect the kernel
+  console (fbcon) rather than SpringBoard.
 - **Dedicated FLEUR machine config**: not needed to boot (SWEET + fleur ADT
   works), but cleaner for timer/topology defaults before upstreaming.
 - Full GPT map: only the first 32 entries fit the console; read the rest from
