@@ -31,7 +31,12 @@ TIMEOUT_MS = 30000
 
 
 def find_fastboot(vid=None, pid=None):
-    devs = list(usb.core.find(find_all=True, idVendor=vid, idProduct=pid))
+    kw = {}
+    if vid is not None:
+        kw["idVendor"] = vid
+    if pid is not None:
+        kw["idProduct"] = pid
+    devs = list(usb.core.find(find_all=True, **kw))
     for dev in devs:
         try:
             cfg = dev.get_active_configuration()
@@ -57,14 +62,23 @@ def endpoints(intf):
     return ep_in, ep_out
 
 
+_rx = bytearray()
+
+
 def read_exact(ep, n):
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = ep.read(n - len(buf), timeout=TIMEOUT_MS)
+    """Read exactly n bytes from a bulk endpoint.
+
+    Always ask for at least one max-size packet: a shorter request makes
+    libusb report "overflow" when the device's 512-byte packet arrives.
+    """
+    while len(_rx) < n:
+        chunk = ep.read(max(512, n - len(_rx)), timeout=TIMEOUT_MS)
         if not chunk:
             raise IOError("short read from device")
-        buf += bytes(chunk)
-    return bytes(buf)
+        _rx.extend(chunk)
+    out = bytes(_rx[:n])
+    del _rx[:n]
+    return out
 
 
 def read_status(ep_in):

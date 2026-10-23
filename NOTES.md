@@ -775,11 +775,15 @@ launchd/daemon panic.
 - Log extraction without filming: patch 0047 already mirrors the console to
   the last 1025 blocks (4 MiB ring + header) of `userdata` every second.
   fastboot 37's `fetch` **protocol** accepts a byte range
-  (`fetch:PARTITION:0xOFFSET:0xSIZE`), but its CLI only fetches whole
-  partitions.  Plan: a pyusb client (pyusb is installed) to fetch
-  `[partition_size - 0x401000, partition_size)`, gated on
-  `getvar max-fetch-size` being non-zero, then decode with
-  `tools/sweet-log.py`.
+  (`fetch:PARTITION:0xOFFSET:0xSIZE`); `tools/fastboot-fetch-range.py` is a
+  pyusb client for it.  **But fleur's LK does not implement fetch**: there is
+  no `max-fetch-size` var and `fetch:...` answers `FAILunknown command`.
+  This LK also uses the legacy, length-less framing (`getvar:version` returns
+  `OKAY0.5`; `FAIL` is followed directly by the text), which the AOSP CLI
+  tolerates but a naive standard client does not.  So the fetched-log plan is
+  dead unless the bootloader changes; the immediate route is filming the
+  crash, and the durable route is to have the kernel write the ring somewhere
+  readable (or boot a recovery with adb).
 
 ## Blocked
 - **Kernel builds**: `dipa-studio/ios-sweet` denies pushes and
