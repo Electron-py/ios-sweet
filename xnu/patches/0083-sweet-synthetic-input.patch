@@ -1,0 +1,178 @@
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -13,8 +13,14 @@
+  *   SweetHIDTouch    the built-in touch screen (digitizer collections)
+  *
+  * Hardware drivers feed them through the C entry points sweet_hid_key()
+- * and sweet_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
+- * every N seconds, to test the event path without input hardware.
++ * and sweet_hid_touch(). On hardware where neither is wired up yet, three
++ * boot-args drive the same hooks so the event path can be exercised (and
++ * the UI driven) anyway:
++ *
++ *   sweethidtest=N  press Home every N seconds (press, then release)
++ *   sweeptouch=N    a scripted gesture every N seconds: a swipe up from
++ *                   the bottom edge, then a tap, alternating
++ *   sweethidkey=N   one of power / volume up / volume down every N seconds
+  */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
+@@ -336,9 +342,13 @@
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 1; }
+ private:
+ 	static void testFired(OSObject *owner, IOTimerEventSource *sender);
++	static void keySynthFired(OSObject *owner, IOTimerEventSource *sender);
+ 	IOTimerEventSource *fTest;
++	IOTimerEventSource *fKeySynth;
+ 	UInt32 fTestSecs;
+ 	UInt32 fTestCount;
++	UInt32 fKeySynthSecs;
++	unsigned fKeySynthStep;
+ };
+ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+ 
+@@ -356,6 +366,9 @@
+  * app-switcher gesture.
+  */
+ #define SWEET_TOUCH_EDGE_PX 48
++/* sweeptouch: gesture tick, and the delay before the first gesture (SpringBoard) */
++#define SWEET_SYNTH_TICK_MS 50
++#define SWEET_SYNTH_FIRST_MS 45000
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+@@ -366,7 +379,12 @@
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Dig_TouchScreen; }
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
+ private:
++	static void synthFired(OSObject *owner, IOTimerEventSource *sender);
+ 	IOLock *fLock;
++	IOTimerEventSource *fSynth;
++	UInt32 fSynthSecs;
++	unsigned fSynthStep;
++	unsigned fSynthCycle;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+@@ -381,6 +399,12 @@
+ bool
+ SweetHIDButtons::start(IOService *provider)
+ {
++	fTest = NULL;
++	fKeySynth = NULL;
++	fTestSecs = 0;
++	fTestCount = 0;
++	fKeySynthSecs = 0;
++	fKeySynthStep = 0;
+ 	if (!IOHIDEventService::start(provider)) {
+ 		return false;
+ 	}
+@@ -392,7 +416,16 @@
+ 	}
+ 	gSweetButtons = this;
+ 	registerService();
+-	IOLog("SWEET HID: buttons registered (test every %u s)\n", fTestSecs);
++	if (PE_parse_boot_argn("sweethidkey", &fKeySynthSecs, sizeof(fKeySynthSecs)) && fKeySynthSecs) {
++		fKeySynth = IOTimerEventSource::timerEventSource(this, &SweetHIDButtons::keySynthFired);
++		if (fKeySynth && _hidWorkLoop->addEventSource(fKeySynth) == kIOReturnSuccess) {
++			fKeySynth->setTimeoutMS(fKeySynthSecs * 1000);
++		} else {
++			fKeySynth = NULL;
++		}
++	}
++	IOLog("SWEET HID: buttons registered (test every %u s, key synth every %u s)\n",
++	    fTestSecs, fKeySynthSecs);
+ 	return true;
+ }
+ 
+@@ -425,6 +458,32 @@
+ 	}
+ }
+ 
++/*
++ * sweethidkey: walk the physical keys. Power comes first (it sleeps the
++ * panel; the next press wakes it again), then volume up and volume down,
++ * so the key plumbing and the wake path both get exercised with no keys
++ * wired up. Press, release, wait out the period, next key.
++ */
++void
++SweetHIDButtons::keySynthFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	SweetHIDButtons *self = (SweetHIDButtons *)owner;
++	static const UInt32 usages[] = {
++		kHIDUsage_Csmr_Power, kHIDUsage_Csmr_VolumeIncrement,
++		kHIDUsage_Csmr_VolumeDecrement,
++	};
++	bool down = (self->fKeySynthStep & 1) == 0;
++
++	if (down) {
++		self->key(usages[(self->fKeySynthStep / 2) % 3], true);
++		self->fKeySynthStep++;
++		sender->setTimeoutMS(150);
++		return;
++	}
++	self->fKeySynthStep++;
++	sender->setTimeoutMS(self->fKeySynthSecs * 1000);
++}
++
+ bool
+ SweetHIDTouch::start(IOService *provider)
+ {
+@@ -444,10 +503,57 @@
+ 	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
+ 	gSweetTouch = this;
+ 	registerService();
++	fSynth = NULL;
++	fSynthSecs = 0;
++	fSynthStep = 0;
++	fSynthCycle = 0;
++	if (PE_parse_boot_argn("sweeptouch", &fSynthSecs, sizeof(fSynthSecs)) && fSynthSecs) {
++		fSynth = IOTimerEventSource::timerEventSource(this, &SweetHIDTouch::synthFired);
++		if (fSynth && _hidWorkLoop->addEventSource(fSynth) == kIOReturnSuccess) {
++			fSynth->setTimeoutMS(SWEET_SYNTH_FIRST_MS);
++			IOLog("SWEET HID: touch synth on (gesture every %u s, first in %u s)\n",
++			    fSynthSecs, (unsigned)(SWEET_SYNTH_FIRST_MS / 1000));
++		} else {
++			fSynth = NULL;
++		}
++	}
+ 	IOLog("SWEET HID: touch registered\n");
+ 	return true;
+ }
+ 
++/*
++ * sweeptouch: a gesture sent through the same entry point a driver would
++ * use, so backboardd, UIKit and SpringBoard see nothing synthetic. The
++ * swipe starts 9 px off the bottom edge, inside SWEET_TOUCH_EDGE_PX, so it
++ * carries the edge-tip bit UIKit needs for unlock/home; the tap lands in
++ * the middle of the screen where the dock's centre icon sits.
++ */
++void
++SweetHIDTouch::synthFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	SweetHIDTouch *self = (SweetHIDTouch *)owner;
++	bool swipe = (self->fSynthCycle & 1) == 0;
++	unsigned step = self->fSynthStep;
++	unsigned last = swipe ? 20 : 6;
++
++	if (step == 0) {
++		self->touch(0, true, 540, swipe ? 2390 : 1200);
++	} else if (step <= last) {
++		int y = swipe ? 2390 - (2390 - 700) * (int)step / 20 : 1200;
++		self->touch(0, true, 540, y);
++	} else {
++		self->touch(0, false, 540, swipe ? 700 : 1200);
++		self->fSynthStep = 0;
++		self->fSynthCycle++;
++		unsigned run = (last + 2) * SWEET_SYNTH_TICK_MS;
++		unsigned period = self->fSynthSecs * 1000;
++		sender->setTimeoutMS(period > run ? period - run : SWEET_SYNTH_TICK_MS);
++		return;
++	}
++	self->fSynthStep++;
++	sender->setTimeoutMS(SWEET_SYNTH_TICK_MS);
++}
++
+ void
+ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ {
