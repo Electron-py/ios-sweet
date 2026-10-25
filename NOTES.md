@@ -23,7 +23,7 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 - iOS root = HFS+ in `userdata` partition (LUN 2)
 - Ring buffer at `0x1dc9bf7000` (4 MiB, header `SWEETLOG`)
 
-## Current state (2026-10-25)
+## Current state (2026-10-25, updated 16:15)
 
 ### ✅ Working
 - Full 8-core boot (`cpus=8`)
@@ -33,12 +33,15 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 - Console logging (persistent ring, `/dev/null` tee for SpringBoard/lsd/datamigrator/installd)
 - SMP stack sampler (`sweetsample`), heap text dumper (`sweetscan`), crash reports
 - ADT with `/product` node (iPhone10,3 identity) — unblocked `LSApplicationRecord`
+- **Patch 0083 committed**: synthetic input boot-args (`sweeptouch`, `sweethidkey`)
+- **Patch 0084 committed**: MTK I2C + FocalTech FTS touch driver (in CI build tree)
+- **CI build green** (run 40203488333, macos-14, Xcode 15.4)
 
 ### ⚠️ Missing (blockers for "usable")
 | Feature | Hardware | What's needed |
 |---------|----------|---------------|
-| **Touch** | FocalTech FTS, I2C, IRQ=15, RST=16, AVDD=58 | MTK I2C controller driver + FTS protocol driver + DT nodes |
-| **Buttons** | PMIC/GPIO (Vol+/Vol-/Power) | MTK PMIC/GPIO key driver + DT nodes |
+| **Touch** | FocalTech FTS, I2C, IRQ=15, RST=16, AVDD=58 | **Patch 0084 written** — needs kernel build + test on device |
+| **Buttons** | PMIC/GPIO (Vol+/Vol-/Power) | MTK PMIC/GPIO key driver (patch 0085 next) |
 | **Background/wallpaper** | CPU renderer path (no GPU) | QuartzCore CPU renderer + wallpaper service |
 
 ### 🛠 Tools written (committed in `tools/`)
@@ -68,11 +71,12 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 - Fresh dispatch: `gh workflow run xnu.yml -R Electron-py/ios-sweet --ref fleur`
 
 ## Immediate plan
-1. Commit patch **0083** (synthetic input: `sweeptouch`, `sweethidkey`) — already tested via `sweethidtest`
-2. Dispatch CI build to verify toolchain green
-3. Write **patch 0084**: MTK I2C controller + FocalTech FTS touch driver
-4. Write **patch 0085**: MTK PMIC/GPIO keys driver
-5. Investigate CPU wallpaper renderer (QuartzCore `CA::OGL::SW`)
+1. ✅ Commit patch **0083** (synthetic input: `sweeptouch`, `sweethidkey`) — tested via `sweethidtest`
+2. ✅ Dispatch CI build to verify toolchain green (run 40203488333 **success**)
+3. ✅ Write **patch 0084**: MTK I2C controller + FocalTech FTS touch driver (committed)
+4. **Next**: Write **patch 0085**: MTK PMIC/GPIO keys driver
+5. **Next**: Build & test kernel with 0084 on device (ring pull → flash → boot)
+6. Investigate CPU wallpaper renderer (QuartzCore `CA::OGL::SW`)
 
 ## Relevant files
 - `/tmp/opencode/console8.txt` — next ring (armed)
