@@ -151,6 +151,7 @@ The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces 
 | `.github/workflows/xnu.yml` | Kernel CI build |
 | `tools/mkadt.py` | Generates the Apple Device Tree from sweet's MMIO layout and the iPhone X identity |
 | `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload |
+| `tools/clean-console.py` | Renames the ADT `sweet-fbcon` node so the kernel draws nothing on the panel (ring only) |
 | `tools/mkiosroot.sh` | Builds the HFS+ iOS root from the IPSW images |
 | `tools/sweet-root-tweaks.py` | Bring-up changes to the root (Setup skip, activation, daemons) |
 | `tools/sweet-log-pull.sh`, `sweet-log.py` | Read the persistent kernel log from recovery |

@@ -74,6 +74,28 @@ static int magic_ok(const char *m)
 	return 1;
 }
 
+/* Does this ADT (the payload's copy) contain the fbcon node?  fbcon_probe()
+ * (xnu patch 0003) is the only kernel reader of "sweet-fbcon", and it is what
+ * erases our report before kprintf takes over the panel. */
+static int adt_has_node(uintptr_t adt, uint64_t len, const char *want)
+{
+	const volatile unsigned char *p = (const volatile unsigned char *)adt;
+	uint64_t wl = 0;
+
+	while (want[wl])
+		wl++;
+	if (len < wl)
+		return 0;
+	for (uint64_t i = 0; i + wl <= len; i++) {
+		uint64_t j = 0;
+		while (j < wl && p[i + j] == (unsigned char)want[j])
+			j++;
+		if (j == wl)
+			return 1;
+	}
+	return 0;
+}
+
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
 int
@@ -151,6 +173,17 @@ const char *loader_boot(uintptr_t dtb)
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
 	con_hex("JUMP", entry_pa);
 	con_str("XNU", "jumping (fbcon clears screen)");
+
+	/*
+	 * With the console off (tools/clean-console.py renamed "sweet-fbcon") there
+	 * is no fbcon_init() to erase this report, and the panel would keep showing
+	 * it until the first GUI swap.  Clear here so xnu comes up on a black
+	 * screen; a payload that still has the node keeps its report on screen.
+	 */
+	if (!adt_has_node(rd_start + p->adt_off, p->adt_size, "sweet-fbcon")) {
+		con_str("XNU", "no fbcon node: clearing the panel");
+		con_clear(BLACK);
+	}
 
 	/* Everything was written with the MMU and caches off; drop any stale I-cache lines too. */
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");

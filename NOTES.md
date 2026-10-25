@@ -785,6 +785,89 @@ launchd/daemon panic.
   crash, and the durable route is to have the kernel write the ring somewhere
   readable (or boot a recovery with adb).
 
+## On-device 2026-10-25 (milestone 10, ring pulls + a clean panel)
+
+**Log extraction now always goes through mtkclient BROM, not fastboot.**
+`fetch` is dead on this LK (milestone 9), so read the persistent console ring
+(patch 0047, last 0x401000 bytes of `userdata`) over BROM/V6:
+
+    # power the phone off, then plug USB in WITHOUT holding any button (BROM)
+    cd /home/tom/mtkclient && python3 mtk.py \
+        --preloader <fleur_global_images>/images/preloader_fleur.bin \
+        --loader Loader/MTK_DA_V_V6.bin \
+        ro 0x1dc9bf7000 0x401000 /tmp/opencode/console-ring.bin
+    python3 tools/sweet-log.py /tmp/opencode/console-ring.bin /tmp/opencode/console.txt
+
+    userdata starts 0x2f7800000, size 0x1ad27f8000, ends 0x1dc9ff8000;
+    ring = end - 0x401000 = 0x1dc9bf7000.  MT6781, UFS `MT128GAXAU2U22`.
+
+**The SpringBoard asset fix came back.**  Boot 2026-10-25 08:35 (ring
+`/tmp/opencode/console.txt`, 299 KB) has **200 `CRASH SpringBoard`** with
+`NSInternalInconsistencyException ... BoundingPathBitmap-1125x2436-375x812-3.00x`
+and ends in `Too many corpses being created`.  The `UIKitCore.framework`
+`BoundingPathData.bundle` copy does not survive a root rebuild/flash unless it
+is put back into the raw image *before* `img2simg`.  Rebuilt `fixed6.simg`
+(2026-10-25 11:18) from `ios16-root-20H392-v2.img` (11:17) plus the staged tail
+`/tmp/opencode/userdata-tail-fixed6.simg` (11:25).
+
+**Why the panel is covered in kernel text (the "diag shim" question).**
+There is no "diag mode" in the shim: `shim/out/shim-fleur*.img` differ only in
+the payload's 608-byte boot-args field, and the name is left over from the
+build used while the on-screen console was our only log channel.  The images:
+
+| image | boot-args delta |
+| --- | --- |
+| `shim-fleur-diag.img` (= `.orig`/`.bak`) | `sweetsample=-`, **no** `sweetfb_noconsole` |
+| `shim-fleur-mute.img` | `+ sweetfb_noconsole=1` |
+| `shim-fleur.img` / `shim-fleur-sample.img` | `+ sweetsample=SpringBoard` |
+| `shim-fleur-clean.img` (new) | same as mute, but ADT `sweet-fbcon` renamed |
+
+`sweetfb_noconsole=1` only switches on inside `AppleCLCD::swap()` at the
+**first** GUI swap (patch 0067 sets `sweet_console_muted`, which `_cnputs`
+honours; panics still draw).  Everything printed during boot before
+backboardd's first swap is therefore drawn over the logo and stays there - and
+the 08:35 ring shows only `swap 3`, `swap 4`, then `SWEET FB: display off`
+(patch 0079 fading the panel), so the mute buys very little on a boot where
+SpringBoard crash-loops.
+
+**Clean panel without a kernel build** (no CI needed):
+
+- `tools/clean-console.py PAYLOAD.bin OUT.bin` renames the ADT node
+  `sweet-fbcon` -> `sweet-fboff` in place (3 bytes; the ADT keeps its size and
+  offset, so the payload header stays valid).  `fbcon_probe()` (patch 0003) is
+  the **only** reader of that node, so the framebuffer console never
+  registers: no kernel text and **no panic text on the panel** - the ring is
+  then the only log.  Debug a hang by flashing `shim-fleur-mute.img` instead.
+- `shim/loader.c` now checks the payload's ADT for `sweet-fbcon` before
+  jumping: if the node is gone it prints `no fbcon node: clearing the panel`
+  and clears the panel itself, because `fbcon_init()` used to do that.
+  `shim/console.h` gained `BLACK`.
+- Built with `./build-fleur.sh /tmp/opencode/payload-fleur-clean.bin`
+  (payload = the live one, extracted from the flashed boot image, so the
+  kernel and boot-args are unchanged) -> `shim/out/shim-fleur-clean.img`.
+
+Open at the time of writing: flash `fixed6.simg` (full + `sparse-tail.py`
+tail), flash `shim-fleur-clean.img` to `boot_b` (slot b), reboot, watch the
+panel.  Expected: black -> Apple logo -> SpringBoard home screen, and a ring
+without `CRASH SpringBoard`.
+
+**Daemon respawns (still open).**  `com.apple.fairplayd.H2` and
+`com.apple.bluetoothd` exit *cleanly* (no `CRASH` line) and are relaunched
+about ten times each by their `KeepAlive` jobs, which is noise in every ring
+pull.  Guessed cause, not proven: the AKS stub returns `0xe00002c7`
+(`kIOReturnUnsupported`) for selector 10 (securityd hammers it; `profiled`
+sel 31 and `sharingd` sel 57 fail too).  Two ways forward, both untouched:
+implement AKS selectors 10/31, or stop the jobs (`Disabled=true` in their
+LaunchDaemon plists plus `/var/db/com.apple.xpc.launchd/disabled.plist`).
+`driverkitd`'s single `sig 9 reason ns 1 code 0x7` looks like a jetsam idle
+exit and is not a bug we need to chase.
+
+**USB live logging stays deferred on fleur.**  The sweet work has
+`sweetusb=2` (CDC-ECM + `tools/sweet-usbnet.sh`), but fleur's SWEET prints
+`controller unpowered or unclocked; DWC3 not read` - there is no DWC3 gadget
+driver, and getting a stream would also need an Apple USB personality plus
+lockdown/usbmux.  Ring + mtkclient is the practical path until the UI is up.
+
 ## Blocked
 - **Kernel builds**: `dipa-studio/ios-sweet` denies pushes and
   `workflow_dispatch` to the available GitHub account (403), so CI runs on the
