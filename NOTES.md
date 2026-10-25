@@ -846,10 +846,100 @@ SpringBoard crash-loops.
   (payload = the live one, extracted from the flashed boot image, so the
   kernel and boot-args are unchanged) -> `shim/out/shim-fleur-clean.img`.
 
-Open at the time of writing: flash `fixed6.simg` (full + `sparse-tail.py`
-tail), flash `shim-fleur-clean.img` to `boot_b` (slot b), reboot, watch the
-panel.  Expected: black -> Apple logo -> SpringBoard home screen, and a ring
-without `CRASH SpringBoard`.
+Flashed 2026-10-25 ~12:05 local, all from the PC without sudo (this LK's
+fastboot is accessible to the user account):
+
+    fastboot flash userdata .../ios16-root-20H392-v2.img.fixed6.simg
+        -> 92/93 written, 93/93 "sparse image write failure" (expected), 7m28s
+    fastboot flash userdata /tmp/opencode/userdata-tail-fixed6.simg   -> OKAY 40s
+    fastboot flash boot_b shim/out/shim-fleur-clean.img               -> OKAY
+    fastboot reboot
+
+Expected on the panel: black -> Apple logo -> SpringBoard home screen, and a
+ring without `CRASH SpringBoard`.
+
+**Boot results 2026-10-25 afternoon (what the expectation turned into).**
+
+- *Observation* - the clean image (fbcon node removed) **freezes**.
+  `/tmp/opencode/console-ring2.bin` and `ring3.bin` are byte-identical
+  (`cmp`): 44048 bytes, `flush #4`, 313 `exec`, last line `exec akd`, 0
+  swaps, panel on the Apple logo 26 min later (one boot, not two: the user
+  never power-cycled between the reads).
+- *Observation* - with fbcon back on (probe image: `sweetsample=...`) the
+  same root boots past that point: ring5 67257 B / `flush #16`,
+  `SWEET FB: display on` at line 780, swaps 2/3/4, `SMP --- sample 0`.
+  Ring6 (15 min of uptime): 106264 B / `flush #51`, 8 samples (90 s + 7x120 s
+  = 930 s), 333 exec, **0 `CRASH SpringBoard`, 0 `BoundingPath`** - the
+  UIKitCore asset fix holds - but still only 3 swaps and the panel stayed on
+  the logo the whole time.  So: *removing the fbcon node is what hangs the
+  boot* (guess as to why: not yet established), and the mute is doing its job
+  because swap 2 is a full-screen frame that paints over the early text.
+- *Observation, symbolicated* - `research/` no longer held the shared cache,
+  so it was rebuilt from the local IPSW:
+  `ipsw extract --dyld --dyld-arch arm64 -o research/dsc <ipsw>` ->
+  `research/dsc/20H392__iPhone10,3_6/dyld_shared_cache_arm64`
+  (`tools/sweet-crash.py research/dsc/20H392__iPhone10,3_6/dyld_shared_cache_arm64 x FILE`
+  resolves 0 of 31 frames as `?`).  With it, sample 7 of ring6 says:
+
+  ```
+  SpringBoard t0  mach_msg2_trap <- dispatch_mach_send_and_wait_for_reply
+                  <- xpc_connection_send_message_with_reply_sync
+                  <- -[NSXPCConnection _sendSelector:withProxy:]
+                  <- LAUNCH_SERVICES_WAS_ASKED_TO_PERFORM_BLOCKING_IO_ON_THE_MAIN_QUEUE
+                  <- _LSCopyServerStore <- _LSContextInitCommon
+                  <- -[LSApplicationRecord _initWithNode:bundleIdentifier:...]
+  SpringBoard t2  same LS context lock, from
+                  -[FBApplicationDataStoreRepositoryManager clearExpiredUninstalledApplications...]
+  ```
+
+  Identical `sp` (`0x16bb0d960`) at sample 0 (90 s) and sample 7 (930 s):
+  the main thread never left that synchronous XPC call.  SpringBoard has 4
+  threads.  **SpringBoard is waiting for `lsd`, not crashing.**
+- *Observation* - `installd` never execs (0 lines in ring6);
+  `com.apple.datamigrator` execs 3x (lines 609, 861, 1098) and exits each
+  time; `lsd` starts (line 597) and only does AKS 0/7.  *Guess:* `lsd` is
+  waiting for installd/migration and therefore never replies - unproven until
+  ring7 samples `lsd` itself.
+- *Observation* - **the ADT has no `/product` node.**  `tools/mkadt.py`
+  copies it from `research/ipsw-x/d22ap.adt`, which the 2026-10-17 disk
+  cleanup removed; since then `mkadt` only prints a warning to stderr and
+  emits an ADT without it.  Parsing the *flashed* payload
+  (`/tmp/opencode/payload-fleur-live.bin`, ADT at `0xfd4f20`, 10104 bytes)
+  confirms it: children are chosen/defaults/cpus/arm-io/sweet-fbcon/buttons/
+  pram/sweet-ufs - no product.  That node is where MobileGestalt's answers
+  live (`product-name = 'iPhone X'`, `artwork-device-idiom = 'phone'`,
+  `artwork-scale-factor = 0x3`, `artwork-device-subtype = 0x984`,
+  `artwork-display-gamut = 'P3'`, `graphics-featureset-class = 'APPLE4'`,
+  `device-perf-memory-class`, `thin-bezel`, `oled-display`,
+  `compatible-device-fallback = 'iPhone9,2'`, ...), which is the "you have to
+  bypass MobileGestalt for the lock screen" advice from the reddit thread the
+  user relayed.  Recovered unprivileged from the local IPSW:
+  `unzip ... Firmware/all_flash/DeviceTree.d22ap.im4p` +
+  `ipsw img4 im4p extract ... -o research/ipsw-x/d22ap.adt` (186084 B).
+  (`research/` is gitignored, so nothing Apple-owned is committed.)
+
+Two new tools (both committed):
+
+- `tools/payload-bootargs.py PAYLOAD [-o OUT --set NAME=VALUE ...] [-o OUT --unset NAME ...]`
+  shows or edits the payload's 608-byte cmdline at 0x48, so boot-args change
+  without a kernel or payload rebuild.
+- `tools/replace-adt.py PAYLOAD ADT OUT` swaps the ADT in place: the ADT is
+  the payload's last content (every segment ends at `adt_off`), so only
+  `adt_size` moves.  It refuses a partially-parsing ADT or a
+  `dram-base`/`dram-size` that disagrees with the payload's
+  `phys_base`/`mem_size`.
+
+Images built from the live payload + restored `/product`
+(`fleur-product.adt`, 12788 bytes, children now include `product`), both
+carrying `sweetsample`/`sweetnull`/`sweetscan` = `SpringBoard,lsd,datamigrator,installd`:
+
+| image | boot-args delta vs probe | purpose |
+| --- | --- | --- |
+| `shim-fleur-gestalt.img` | + `/product` ADT | one shot: fix Gestalt, and if it still stalls the ring gets lsd's backtrace + those daemons' stderr |
+| `shim-fleur-verbose.img` | + `/product`, **minus** `sweetfb_noconsole` | console never mutes: everything is readable on the panel |
+
+`shim-fleur-gestalt.img` flashed 13:41, panel still Apple logo after 10 min
+(same stall) -> ring7 pull armed, then `shim-fleur-verbose.img`.
 
 **Daemon respawns (still open).**  `com.apple.fairplayd.H2` and
 `com.apple.bluetoothd` exit *cleanly* (no `CRASH` line) and are relaunched
@@ -877,10 +967,14 @@ lockdown/usbmux.  Ring + mtkclient is the practical path until the UI is up.
   on 2026-11-02; the workflow needs a newer image with an Xcode-15-compatible
   `iig`, or a queued run after the brownout.  The binary-patched kernel covers
   fleur meanwhile.
-- **iOS on fleur**: the v2 image is flashed; HFS+ mounts, launchd and
-  SpringBoard run, but SpringBoard SIGTRAPs and launchd relaunches it.  The
-  crash backtrace is the next thing to read.  No IOMFB/touch/USB driver on
-  fleur yet, so the only output is the kernel console (fbcon).
+- **iOS on fleur**: the fixed6 root is flashed; launchd reaches
+  `Early boot complete`, 333 daemons exec, and SpringBoard no longer crashes
+  (0 `CRASH SpringBoard`, 0 `BoundingPath` since the UIKitCore asset fix).
+  The wall is now **SpringBoard's main thread blocked in a synchronous
+  LaunchServices XPC call to `lsd`** since 90 s (see milestone 10 boot
+  results), with `installd` never starting and `com.apple.datamigrator`
+  exiting 3x.  Next: read ring7 (`lsd` sampled) and the verbose panel.
+  No IOMFB/touch/USB driver on fleur yet, so output is the ring plus fbcon.
 - **Dedicated FLEUR machine config**: not needed to boot (SWEET + fleur ADT
   works), but cleaner for timer/topology defaults before upstreaming.
 - Full GPT map: only the first 32 entries fit the console; read the rest from
