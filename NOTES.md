@@ -40,8 +40,8 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 ### ⚠️ Missing (blockers for "usable")
 | Feature | Hardware | What's needed |
 |---------|----------|---------------|
-| **Touch** | FocalTech FTS, I2C, IRQ=15, RST=16, AVDD=58 | **Patch 0084 written** — needs kernel build + test on device |
-| **Buttons** | PMIC/GPIO (Vol+/Vol-/Power) | MTK PMIC/GPIO key driver (patch 0085 next) |
+| **Touch** | FocalTech FTS, I2C, IRQ=15, RST=16, AVDD=58 | **Patch 0084 committed** — needs kernel build + device test |
+| **Buttons** | PMIC/GPIO (Vol+/Vol-/Power) | **Patch 0085 committed** — needs kernel build + device test |
 | **Background/wallpaper** | CPU renderer path (no GPU) | QuartzCore CPU renderer + wallpaper service |
 
 ### 🛠 Tools written (committed in `tools/`)
@@ -74,8 +74,8 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 1. ✅ Commit patch **0083** (synthetic input: `sweeptouch`, `sweethidkey`) — tested via `sweethidtest`
 2. ✅ Dispatch CI build to verify toolchain green (run 40203488333 **success**)
 3. ✅ Write **patch 0084**: MTK I2C controller + FocalTech FTS touch driver (committed)
-4. **Next**: Write **patch 0085**: MTK PMIC/GPIO keys driver
-5. **Next**: Build & test kernel with 0084 on device (ring pull → flash → boot)
+4. ✅ Write **patch 0085**: MTK keypad + PMIC power key driver (committed)
+5. **Next**: Build & test kernel with 0084+0085 on device (ring pull → flash → boot)
 6. Investigate CPU wallpaper renderer (QuartzCore `CA::OGL::SW`)
 
 ## Relevant files
@@ -93,4 +93,4 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 
 ---
 
-*Updated 2026-10-25 after home-screen milestone (sweethidtest=8 unlocked to home screen).*
+*Updated 2026-10-25 16:45 after patches 0083/0084/0085 committed and CI green.*
