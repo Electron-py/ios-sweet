@@ -25,6 +25,30 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 
 ## Current state (2026-10-26, updated 21:45)
 
+### ⏸ STOPPING POINT — resume here next session
+- **Touch is DONE** (user confirmed on screen with `shim-fleur-touchkeys7.img`).
+  The bug was the FTS point-count byte (`ce4747b`); see the tk6 section below.
+- **No flash watcher is armed** — deliberately killed at stop, because a stale
+  watcher silently flashes `boot_b` during unrelated fastboot work. Re-arm with:
+  `nohup bash /tmp/opencode/flash-watch.sh /home/tom/Documents/musi/ios-sweet/shim/out/shim-fleur-nohome.img > /tmp/opencode/flash-watch-nohome.log 2>&1 &`
+  (the script is **not** executable — always invoke it with `bash`), then ask
+  the user for **Vol-Down + Power**. It exits after flashing + `fastboot reboot`.
+- **Image already built, no CI needed** (boot-args only): `shim-fleur-nohome.img`
+  from run **40394561768**. The `sweethidtest=8` removal lives in the *local*
+  script `/tmp/opencode/build-new-image.sh` (`BASE`), not in git.
+- **Next task = buttons**: with no synthetic Home press, test volume-up
+  (matrix hw 17) and power (hw 8). Expect
+  `SWEET FLEUR KEYS: hw 17 r1/c8 down … mapped` / `hw 8 … mapped`, then
+  `SWEET HID: key 0x… down (1 clients)`.
+  - hw 8 never appears → add the read-only PWRAP read of
+    `MT6358_PWRKEY_PRESS_STS` (`PMIC_BASE + 0xa40`) via `pwrap_read16()`
+  - then add the HakiOS **two-look** filter to `sweet_fleur_keys.c`
+- Unfinished and untouched: the 3 lost root hand-fixes (needs user `sudo`),
+  wallpaper renderer.
+- Working tree clean, everything pushed to `fork` (`Electron-py/ios-sweet`,
+  branch `fleur`), HEAD `19a9601`.
+
+
 ### ✅ Working
 - Full 8-core boot (`cpus=8`)
 - HFS+ root mounts rw from `userdata`
