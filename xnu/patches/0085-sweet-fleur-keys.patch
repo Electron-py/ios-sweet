@@ -12,10 +12,10 @@ index 0b14e68..56a66c8 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_fleur_keys.c b/bsd/dev/sweet_fleur_keys.c
 new file mode 100644
-index 0000000..0cff783
+index 0000000..8d2cd05
 --- /dev/null
 +++ b/bsd/dev/sweet_fleur_keys.c
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,398 @@
 +/*
 + * FLEUR MT6781: MTK keypad controller driver (power / volume keys).
 + *
@@ -45,6 +45,25 @@ index 0000000..0cff783
 + * No pwrap / PMIC accesses are made here -- the PMIC pwrkey line belongs
 + * to the mt6358 interrupt tree and is deliberately left alone, since
 + * poking pwrap without its init sequence is how you wedge a phone.
++ *
++ * What the vendor driver writes at boot, audited line by line:
++ *
++ *   probe() -> kpd_set_debounce(0x400)          [KP_DEBOUNCE = 0x18]
++ *            -> request_irq()
++ *   kpd_open()                                  -> no-op
++ *   enable_kpd() / kpd_wakeup_src_setting()     -> suspend/resume only
++ *   kpd_double_key_enable()                     -> double-key props only
++ *                                                    (fleur has none)
++ *
++ * i.e. KP_SEL (0x20) and KP_EN (0x24) are *never* written by Android at
++ * boot -- whatever reset/LK left there is what makes the scan work.  We
++ * used to zero KP_SEL and write KP_EN = 1; the touchkeys5 ring then
++ * showed only column 0 readable: hw 0,9,18,27,36,45,54,63 (all 8 rows of
++ * column 0) lighting up together on every press, and column 8 -- which
++ * holds hw 8 (pwrkey) and hw 17 (rstkey = volume up) -- never read once
++ * in 30 presses.  That is what a column-enable mask set to 1 would do.
++ * So: write KP_DEBOUNCE, leave KP_SEL/KP_EN alone, and print every
++ * register before and after so the next ring confirms it.
 + *
 + * Opt-in via boot-arg `sweetkeys`; feeds sweet_hid_key() so backboardd
 + * sees power(0) / vol+(1) / vol-(2) / home(3) exactly like the synthetic
@@ -77,6 +96,7 @@ index 0000000..0cff783
 +#define KP_EN           0x24u
 +#define KP_DEBOUNCE_MASK 0x3FFFu
 +#define KPD_NUM_MEMS    5
++#define KPD_NUM_KEYS    72  /* kpd.h: 8 rows x 9 cols, col 8 = special */
 +
 +/* gpio region mode register for pin p (pinctrl-mt6781.c) */
 +#define GPIO_BASE       0x10005000u
@@ -222,11 +242,48 @@ index 0000000..0cff783
 +	}
 +}
 +
++/*
++ * One line listing every hw keycode currently held.  A scan that does not
++ * resolve rows prints a whole column at once (e.g. "0 9 18 27 36 45 54 63
++ * "), which is exactly the signature we are hunting, so make it obvious.
++ */
++static void
++fk_summary(const uint16_t *st)
++{
++	char buf[176];
++	int n = 0;
++	unsigned i, j, cnt = 0;
++
++	buf[0] = '\0';
++	for (i = 0; i < KPD_NUM_MEMS; ++i) {
++		for (j = 0; j < 16; ++j) {
++			unsigned hw = (i << 4) + j;
++
++			if (hw >= KPD_NUM_KEYS) {
++				break;
++			}
++			/* bit == 0 means pressed (kpd_keymap_handler) */
++			if ((st[i] & (1u << j)) != 0) {
++				continue;
++			}
++			++cnt;
++			if (n < (int)sizeof(buf) - 10) {
++				n += snprintf(buf + n, sizeof(buf) - n,
++				    "%u(r%u/c%u) ", hw, hw / 9u, hw % 9u);
++			}
++		}
++	}
++	if (cnt != 0) {
++		printf("SWEET FLEUR KEYS: down[%u]: %s\n", cnt, buf);
++	}
++}
++
 +static void
 +fk_poll(void)
 +{
 +	uint16_t new_state[KPD_NUM_MEMS];
 +	unsigned i, j;
++	bool changed = false;
 +
 +	fk_get_state(new_state);
 +	for (i = 0; i < KPD_NUM_MEMS; ++i) {
@@ -235,6 +292,7 @@ index 0000000..0cff783
 +		if (change == 0) {
 +			continue;
 +		}
++		changed = true;
 +		for (j = 0; j < 16; ++j) {
 +			uint16_t mask = (uint16_t)(1u << j);
 +			unsigned hw = (i << 4) + j;
@@ -249,10 +307,14 @@ index 0000000..0cff783
 +			if (slot >= 0) {
 +				fk_set(slot, pressed);
 +			}
-+			printf("SWEET FLEUR KEYS: hw %u %s (mem%u=0x%04x "
-+			    "%s)\n", hw, pressed ? "down" : "up", i + 1,
-+			    new_state[i], slot >= 0 ? "mapped" : "raw");
++			printf("SWEET FLEUR KEYS: hw %u r%u/c%u %s (mem%u=0x%04x "
++			    "%s)\n", hw, hw / 9u, hw % 9u,
++			    pressed ? "down" : "up", i + 1, new_state[i],
++			    slot >= 0 ? "mapped" : "raw");
 +		}
++	}
++	if (changed) {
++		fk_summary(new_state);
 +	}
 +	for (i = 0; i < KPD_NUM_MEMS; ++i) {
 +		fk.state[i] = new_state[i];
@@ -284,21 +346,41 @@ index 0000000..0cff783
 +
 +	fk_pinmux();
 +
-+	/* Same three writes the Android driver does at probe time. */
++	/*
++	 * Read everything first.  Android's only boot-time write here is
++	 * KP_DEBOUNCE; KP_SEL and KP_EN are deliberately left alone (see
++	 * the file header).  Both dumps are printed so the ring shows what
++	 * reset/LK had configured, and whether our one write changed
++	 * anything other than the debounce counter.
++	 */
++	printf("SWEET FLEUR KEYS: before sta=0x%04x sel=0x%04x scan=0x%04x "
++	    "en=0x%04x deb=0x%04x mem=0x%04x 0x%04x 0x%04x 0x%04x 0x%04x\n",
++	    fk_rd(fk.kp, KP_STA), fk_rd(fk.kp, KP_SEL),
++	    fk_rd(fk.kp, KP_SCAN_TIMING), fk_rd(fk.kp, KP_EN),
++	    fk_rd(fk.kp, KP_DEBOUNCE), fk_rd(fk.kp, KP_MEM1),
++	    fk_rd(fk.kp, KP_MEM1 + 4), fk_rd(fk.kp, KP_MEM1 + 8),
++	    fk_rd(fk.kp, KP_MEM1 + 12), fk_rd(fk.kp, KP_MEM1 + 16));
++
 +	fk_wr(fk.kp, KP_DEBOUNCE, (uint16_t)(0x400u & KP_DEBOUNCE_MASK));
-+	fk_wr(fk.kp, KP_SEL, 0);
-+	fk_wr(fk.kp, KP_EN, 1);
++
++	/* Only if the block really is off -- never blindly. */
++	if (fk_rd(fk.kp, KP_EN) == 0) {
++		fk_wr(fk.kp, KP_EN, 1);
++		printf("SWEET FLEUR KEYS: KP_EN read 0, wrote 1\n");
++	}
 +
 +	fk_get_state(fk.state);
-+	printf("SWEET FLEUR KEYS: kp_sta=0x%04x mem=0x%04x 0x%04x 0x%04x "
-+	    "0x%04x 0x%04x deb=0x%04x en=0x%04x\n",
-+	    fk_rd(fk.kp, KP_STA), fk.state[0], fk.state[1], fk.state[2],
-+	    fk.state[3], fk.state[4], fk_rd(fk.kp, KP_DEBOUNCE),
-+	    fk_rd(fk.kp, KP_EN));
++	printf("SWEET FLEUR KEYS: after  sta=0x%04x sel=0x%04x scan=0x%04x "
++	    "en=0x%04x deb=0x%04x mem=0x%04x 0x%04x 0x%04x 0x%04x 0x%04x\n",
++	    fk_rd(fk.kp, KP_STA), fk_rd(fk.kp, KP_SEL),
++	    fk_rd(fk.kp, KP_SCAN_TIMING), fk_rd(fk.kp, KP_EN),
++	    fk_rd(fk.kp, KP_DEBOUNCE), fk.state[0], fk.state[1], fk.state[2],
++	    fk.state[3], fk.state[4]);
 +
 +	while (1) {
 +		fk_poll();
-+		fk_wait(20);
++		/* Fast enough to catch a state that is only briefly right. */
++		fk_wait(5);
 +	}
 +
 +out:
