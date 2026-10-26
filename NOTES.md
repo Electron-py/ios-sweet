@@ -23,7 +23,7 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 - iOS root = HFS+ in `userdata` partition (LUN 2)
 - Ring buffer at `0x1dc9bf7000` (4 MiB, header `SWEETLOG`)
 
-## Current state (2026-10-25, updated 16:15)
+## Current state (2026-10-26, updated 14:00)
 
 ### ✅ Working
 - Full 8-core boot (`cpus=8`)
@@ -34,7 +34,8 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 - SMP stack sampler (`sweetsample`), heap text dumper (`sweetscan`), crash reports
 - ADT with `/product` node (iPhone10,3 identity) — unblocked `LSApplicationRecord`
 - **Patch 0083 committed**: synthetic input boot-args (`sweeptouch`, `sweethidkey`)
-- **Patch 0084 committed**: MTK I2C + FocalTech FTS touch driver (in CI build tree)
+- **Patch 0084 + 0085 compiled into the kernel** (CI run **40324405863** green:
+  `CC sweet_fleur_touch.o`, `CC sweet_fleur_keys.o`, both in the link list)
 - **CI build green** (run 40203488333, macos-14, Xcode 15.4)
 
 ### ⚠️ Missing (blockers for "usable")
@@ -60,10 +61,67 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 | `shim-fleur-verbose.img` | same + **no** `sweetfb_noconsole` | live console on screen |
 | `shim-fleur-hidtest.img` | verbose + `sweethidtest=8` | synthetic Home press every 8 s |
 | `shim-fleur-hidtest-8c.img` | hidtest + `cpus=8` | 8 cores + synthetic Home |
+| `shim-fleur-touchkeys3.img` | ci2 line + **`ufslun=2`** | first image with 0084+0085 in the kernel |
 
 ## Next device cycle (automated)
-1. **Pull ring**: Power off (15 s), plug USB → BROM read → `/tmp/opencode/console8.txt`
-2. **Flash next**: Vol-Down + Power → fastboot → watcher flashes new image
+1. **Flash**: Vol-Down + Power → fastboot → `/tmp/opencode/flash-watch.sh`
+   flashes `boot_b` and reboots (console visible on this boot, so the
+   `SWEET FLEUR TOUCH/KEYS` banner and any `SWEET UFS:` line can be read)
+2. **Pull ring**: Power off (15 s), plug USB → BROM read → `tools/sweet-log.py`
+
+## Environment notes
+- `/tmp/opencode` was wiped by a machine reboot (2026-10-26 13:27). Recovered:
+  CI buildtree artifact (`bt/buildtree.tgz`), ADT re-extracted from
+  `shim/out/shim-fleur-touchkeys-ci2.img` → `fleur-product.adt`, Android DT →
+  `fleur.dts`, `console14.txt` from the ring. Build script:
+  `/tmp/opencode/build-new-image.sh <run-id> <name> [extra boot-args…]`.
+- The `xnu-kernel` artifact now ships a `kernel.development.*.link/` directory
+  too — pick the top-level regular file (`-maxdepth 1 -type f`).
+
+## The `IOFindBSDRoot` panic (fixed 2026-10-26)
+
+Boots of `shim-fleur-touchkeys-final.img` and `-ci2.img` died with:
+
+```
+panic(cpu 0 …): IOFindBSDRoot: SWEET UFS root ufsroot0 unavailable: 6 @IOKitBSDInit.cpp:778
+```
+
+`6` is `ENXIO`, returned by `sweet_ufs_init()`. Nothing in those kernels was
+broken: patch **0082** made `su.lun` come from the `ufslun` boot-arg and it
+**defaults to 0**, but the boot lines never carried `ufslun=2`. LUN 0 is a
+4 MiB MTK boot LUN with no GPT, so `ufs_find_partition()` printed
+`SWEET UFS: LUN 0 has no GPT` and returned ENXIO.
+
+Why it worked before: the kernels of the good boots (`hidtest-8c`, `gestalt`,
+`verbose`) predate 0082 — they contain no `ufslun` string at all — and
+`tools/patch-fleur-ufslun.py` had rewritten their instructions so `su.lun = 2`
+unconditionally. That tool only matches the pre-0082 instruction pattern, so
+from 0082 onward the boot line is the only way to pick the LUN.
+
+Two diagnostics that make this confusion easy to repeat:
+- `tools/patch-fleur-ufslun.py` reports `found 0` (or `found 2`) sites — that
+  means the kernel is not pre-0082 anymore; use `ufslun=2` instead.
+- `ufslun` appears in the kernel binary iff patch 0082 is present:
+  `python3 -c "print(open('kernel','rb').read().count(b'ufslun'))"`.
+
+Also note: the ring (`sweetlog`) only starts once UFS init *succeeds*
+(`sweet_log_start()` runs at the end of `sweet_ufs_init()`), so a root-mount
+failure leaves **no** log — the framebuffer (or the panic screen) is the only
+record. The panic's `printf`s above the backtrace are the ones to read.
+
+**Fix: `ufslun=2` is now part of the base boot line in the image build.**
+
+## Patch workflow (0084/0085 and anything new)
+
+- Hand-written diff hunks are unreliable — CI silently *skips* a malformed
+  patch and the run still goes green. Only a compile error fails a run.
+- Always regenerate: `/tmp/opencode/gen-patches.py` extracts the exact CI
+  buildtree baseline (`gh run download <id> -n xnu-buildtree`), applies the
+  driver sources + hooks, writes the diff with `git diff`, then verifies with
+  `git apply --check`.
+- Check every run for the word `Skipping patch … 0084/0085` before believing
+  a kernel contains a driver; also grep the payload for a driver string
+  (`SWEET FLEUR TOUCH: starting`) before flashing.
 
 ## CI kernel builds
 - Workflow: `.github/workflows/xnu.yml` (macos-14 runner, Xcode 15.x)
@@ -75,11 +133,13 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 2. ✅ Dispatch CI build to verify toolchain green (run 40203488333 **success**)
 3. ✅ Write **patch 0084**: MTK I2C controller + FocalTech FTS touch driver (committed)
 4. ✅ Write **patch 0085**: MTK keypad + PMIC power key driver (committed)
-5. **Next**: Build & test kernel with 0084+0085 on device (ring pull → flash → boot)
+5. ✅ Build & test kernel with 0084+0085 on device — CI run 40324405863 green,
+   `shim-fleur-touchkeys3.img` built with `ufslun=2`; **flash + boot pending**
 6. Investigate CPU wallpaper renderer (QuartzCore `CA::OGL::SW`)
 
 ## Relevant files
-- `/tmp/opencode/console8.txt` — next ring (armed)
+- `/tmp/opencode/console14.txt` — last ring decode (172246 B)
+- `/tmp/opencode/gen-patches.py` — regenerate 0084/0085 from the CI baseline
 - `/tmp/opencode/console7.txt` — 8-core hidtest boot (248888 B, 27 samples, 24 swaps)
 - `/tmp/opencode/fleur-dt/fleur.dts` — Android DT (touch@0 = focaltech,fts)
 - `/home/tom/Documents/musi/ios-sweet/xnu/patches/0083-sweet-synthetic-input.patch` — ready
@@ -93,4 +153,4 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 
 ---
 
-*Updated 2026-10-25 16:45 after patches 0083/0084/0085 committed and CI green.*
+*Updated 2026-10-26 14:00: patches 0084/0085 compile into the kernel (CI 40324405863 green) and the `IOFindBSDRoot … unavailable: 6` panic is diagnosed (missing `ufslun=2`, patch 0082's boot arg).*
