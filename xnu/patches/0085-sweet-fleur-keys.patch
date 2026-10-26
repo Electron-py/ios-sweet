@@ -12,10 +12,10 @@ index 0b14e68..56a66c8 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_fleur_keys.c b/bsd/dev/sweet_fleur_keys.c
 new file mode 100644
-index 0000000..6738522
+index 0000000..33f5665
 --- /dev/null
 +++ b/bsd/dev/sweet_fleur_keys.c
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,185 @@
 +/*
 + * FLEUR MT6781: MTK keypad controller driver (volume keys).
 + *
@@ -150,6 +150,12 @@ index 0000000..6738522
 +	fk.kp = ml_io_map(KP_BASE, KP_SIZE);
 +	if (fk.kp == 0) {
 +		printf("SWEET FLEUR KEYS: MMIO mapping failed\n");
++		goto out;
++	}
++	printf("SWEET FLEUR KEYS: kp @0x%llx\n", (unsigned long long)fk.kp);
++	if ((fk.kp >> 48) != 0xffffULL) {
++		printf("SWEET FLEUR KEYS: mapping is not a kernel address, "
++		    "leaving the hardware alone\n");
 +		goto out;
 +	}
 +

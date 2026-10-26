@@ -12,10 +12,10 @@ index 6630131..0b14e68 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_fleur_touch.c b/bsd/dev/sweet_fleur_touch.c
 new file mode 100644
-index 0000000..74c4740
+index 0000000..935d49a
 --- /dev/null
 +++ b/bsd/dev/sweet_fleur_touch.c
-@@ -0,0 +1,359 @@
+@@ -0,0 +1,368 @@
 +/*
 + * FLEUR MT6781: MTK I2C + FocalTech FTS touch driver.
 + * Reads touch reports over I2C and feeds them through sweet_hid_touch().
@@ -76,15 +76,17 @@ index 0000000..74c4740
 +#define I2C_STAT_ARB_LOST       (1u << 2)
 +#define I2C_STAT_TRANSFER_DONE  (1u << 6)
 +
-+/* MTK GPIO controller registers */
++/* MTK GPIO controller registers: *offsets* from GPIO_BASE.  ft_rd/ft_wr add
++ * the base themselves, so these must not carry it -- with the base in both
++ * places the access went to 2 * base + off and killed the kernel. */
 +#define GPIO_BASE       0x10005000u
 +#define GPIO_SIZE       0x2000u
-+#define GPIO_DIR_SET(base, pin) ((base) + 0x200u * ((pin) / 32) + 0x04u)
-+#define GPIO_DIR_CLR(base, pin) ((base) + 0x200u * ((pin) / 32) + 0x08u)
-+#define GPIO_DOUT_SET(base, pin) ((base) + 0x200u * ((pin) / 32) + 0x14u)
-+#define GPIO_DOUT_CLR(base, pin) ((base) + 0x200u * ((pin) / 32) + 0x18u)
-+#define GPIO_DIN(base, pin)     ((base) + 0x200u * ((pin) / 32) + 0x20u)
-+#define GPIO_MODE(base, pin)    ((base) + 0x1000u + 0x40u * (pin))
++#define GPIO_DIR_SET(pin)   (0x200u * ((pin) / 32) + 0x04u)
++#define GPIO_DIR_CLR(pin)   (0x200u * ((pin) / 32) + 0x08u)
++#define GPIO_DOUT_SET(pin)  (0x200u * ((pin) / 32) + 0x14u)
++#define GPIO_DOUT_CLR(pin)  (0x200u * ((pin) / 32) + 0x18u)
++#define GPIO_DIN(pin)       (0x200u * ((pin) / 32) + 0x20u)
++#define GPIO_MODE(pin)      (0x1000u + 0x40u * (pin))
 +
 +#define GPIO_MODE_GPIO  0x0
 +#define GPIO_PULL_UP    0x1
@@ -148,16 +150,16 @@ index 0000000..74c4740
 +static void
 +ft_gpio_mode(unsigned pin, unsigned mode)
 +{
-+	ft_wr(ft.gpio, GPIO_MODE(ft.gpio, pin), mode);
++	ft_wr(ft.gpio, GPIO_MODE(pin), mode);
 +}
 +
 +static void
 +ft_gpio_dir(unsigned pin, bool out)
 +{
 +	if (out) {
-+		ft_wr(ft.gpio, GPIO_DIR_SET(ft.gpio, pin), 1u << (pin % 32));
++		ft_wr(ft.gpio, GPIO_DIR_SET(pin), 1u << (pin % 32));
 +	} else {
-+		ft_wr(ft.gpio, GPIO_DIR_CLR(ft.gpio, pin), 1u << (pin % 32));
++		ft_wr(ft.gpio, GPIO_DIR_CLR(pin), 1u << (pin % 32));
 +	}
 +}
 +
@@ -165,16 +167,16 @@ index 0000000..74c4740
 +ft_gpio_write(unsigned pin, bool high)
 +{
 +	if (high) {
-+		ft_wr(ft.gpio, GPIO_DOUT_SET(ft.gpio, pin), 1u << (pin % 32));
++		ft_wr(ft.gpio, GPIO_DOUT_SET(pin), 1u << (pin % 32));
 +	} else {
-+		ft_wr(ft.gpio, GPIO_DOUT_CLR(ft.gpio, pin), 1u << (pin % 32));
++		ft_wr(ft.gpio, GPIO_DOUT_CLR(pin), 1u << (pin % 32));
 +	}
 +}
 +
 +static bool
 +ft_gpio_read(unsigned pin)
 +{
-+	return (ft_rd(ft.gpio, GPIO_DIN(ft.gpio, pin)) >> (pin % 32)) & 1u;
++	return (ft_rd(ft.gpio, GPIO_DIN(pin)) >> (pin % 32)) & 1u;
 +}
 +
 +static int
@@ -299,12 +301,19 @@ index 0000000..74c4740
 +		printf("SWEET FLEUR TOUCH: MMIO mapping failed\n");
 +		goto out;
 +	}
++	printf("SWEET FLEUR TOUCH: i2c @0x%llx, gpio @0x%llx\n",
++	    (unsigned long long)ft.i2c, (unsigned long long)ft.gpio);
++	if (((ft.i2c | ft.gpio) >> 48) != 0xffffULL) {
++		printf("SWEET FLEUR TOUCH: mapping is not a kernel address, "
++		    "leaving the hardware alone\n");
++		goto out;
++	}
 +
 +	/* IRQ: input with pull-up.  RST/AVDD: outputs. */
 +	ft_gpio_mode(TOUCH_IRQ_GPIO, GPIO_MODE_GPIO);
 +	ft_gpio_dir(TOUCH_IRQ_GPIO, FALSE);
-+	ft_wr(ft.gpio, GPIO_MODE(ft.gpio, TOUCH_IRQ_GPIO),
-+	    (ft_rd(ft.gpio, GPIO_MODE(ft.gpio, TOUCH_IRQ_GPIO)) & ~0x3u) |
++	ft_wr(ft.gpio, GPIO_MODE(TOUCH_IRQ_GPIO),
++	    (ft_rd(ft.gpio, GPIO_MODE(TOUCH_IRQ_GPIO)) & ~0x3u) |
 +	    GPIO_PULL_UP);
 +
 +	ft_gpio_mode(TOUCH_RST_GPIO, GPIO_MODE_GPIO);
