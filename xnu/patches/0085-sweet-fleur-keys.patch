@@ -12,30 +12,44 @@ index 0b14e68..56a66c8 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_fleur_keys.c b/bsd/dev/sweet_fleur_keys.c
 new file mode 100644
-index 0000000..33f5665
+index 0000000..0cff783
 --- /dev/null
 +++ b/bsd/dev/sweet_fleur_keys.c
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,316 @@
 +/*
-+ * FLEUR MT6781: MTK keypad controller driver (volume keys).
++ * FLEUR MT6781: MTK keypad controller driver (power / volume keys).
 + *
-+ * Hardware facts from the Android DTB:
-+ *   mediatek,kp @ 0x10010000, IRQ 0x49, clock "kpd"
-+ *   mediatek,kpd-key-debounce = 0x400
-+ *   mediatek,kpd-sw-pwrkey    = 0x74   (software power key)
-+ *   mediatek,kpd-sw-rstkey    = 0x73   (software reset/home key)
-+ *   mediatek,kpd-hw-dl-key0   = 0x11   (volume up)
-+ *   mediatek,kpd-hw-dl-key2   = 0x08   (volume down)
++ * Register model taken from the MT6781 Android kernel source
++ * (drivers/input/keyboard/mediatek/kpd.c and mt6781/hal_kpd.c):
 + *
-+ * The controller is a free-running status register reader: KP_STA bit0 is
-+ * set while a key is down and the keycode sits in bits 15:8.  No pwrap /
-+ * PMIC accesses are made here -- the PMIC pwrkey line belongs to the
-+ * mt6358 interrupt tree and is deliberately left alone, since poking
-+ * pwrap without its init sequence is how you wedge a phone.
++ *   mediatek,kp @ 0x10010000, IRQ 0x49, clock "kpd" (clk26m, no gate)
++ *     KP_STA       0x00
++ *     KP_MEM1..5   0x04 0x08 0x0c 0x10 0x14   key state, active low
++ *     KP_DEBOUNCE  0x18   (DT mediatek,kpd-key-debounce = 0x400)
++ *     KP_SCAN_TIME 0x1C
++ *     KP_SEL       0x20   double-key select bit
++ *     KP_EN        0x24
++ *
++ * There is no "keycode in KP_STA" register: the controller exposes five
++ * 16-bit state words covering 72 keys (KPD_NUM_KEYS = 72).  Bit 0 means
++ * released, bit 1 means pressed, and hw keycode = (word << 4) | bit --
++ * that is exactly what kpd_keymap_handler() computes.  We poll those
++ * words and diff them, which needs no IRQ and no PMIC access.
++ *
++ * GPIO80 must additionally be muxed to function 1 (KPD) in the gpio
++ * region mode register -- the vendor's gpio_init_default table has
++ * pin 80 mode 1, and no kernel file applies that table for us.
++ * kpdgpiodefault also asks for bias-pull-up <0x66>: adv pull maps that to
++ * R0 = 0, R1 = 1, PUPD = 0 (pull-up) in the iocfg_bm bank.
++ *
++ * No pwrap / PMIC accesses are made here -- the PMIC pwrkey line belongs
++ * to the mt6358 interrupt tree and is deliberately left alone, since
++ * poking pwrap without its init sequence is how you wedge a phone.
 + *
 + * Opt-in via boot-arg `sweetkeys`; feeds sweet_hid_key() so backboardd
 + * sees power(0) / vol+(1) / vol-(2) / home(3) exactly like the synthetic
-+ * sweethidtest path.
++ * sweethidtest path.  Every raw hw keycode change is logged so the ring
++ * can confirm the mapping against the physical buttons.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -52,30 +66,75 @@ index 0000000..33f5665
 +extern void sweet_hid_key(int key, int down);
 +void sweet_fleur_keys_init(void);
 +
-+/* MTK keypad controller registers */
++/* MTK keypad controller registers (hal_kpd.h) */
 +#define KP_BASE         0x10010000u
 +#define KP_SIZE         0x1000u
 +#define KP_STA          0x00u
 +#define KP_MEM1         0x04u
-+#define KP_DEBOUNCE     0x14u
-+#define KP_SEL          0x18u
-+#define KP_EN           0x1Cu
++#define KP_DEBOUNCE     0x18u
++#define KP_SCAN_TIMING  0x1Cu
++#define KP_SEL          0x20u
++#define KP_EN           0x24u
++#define KP_DEBOUNCE_MASK 0x3FFFu
++#define KPD_NUM_MEMS    5
 +
-+/* Keycodes as programmed in the DT (see header). */
-+#define KEY_POWER       0x74
-+#define KEY_HOME        0x73
-+#define KEY_VOLUP       0x11
-+#define KEY_VOLDN       0x08
++/* gpio region mode register for pin p (pinctrl-mt6781.c) */
++#define GPIO_BASE       0x10005000u
++#define GPIO_SIZE       0x1000u
++#define GPIO_MODE(pin)  (0x300u + 0x10u * ((pin) / 8))
++#define GPIO_MODE_SH(pin) (4u * ((pin) % 8))
++
++/* iocfg_bm bank (0x10002800) holds pin 80's pull fields */
++#define IOCFG_BM_BASE   0x10002800u
++#define IOCFG_BM_SIZE   0x200u
++#define BM_PUPD         0x40u   /* bit 0: 0 = pull-up, 1 = pull-down */
++#define BM_R0           0x60u   /* bit 0 */
++#define BM_R1           0x70u   /* bit 0 */
++
++#define KPD_PIN         80u     /* kpdgpiodefault pinmux <0x5001> */
++
++/*
++ * hw keycode -> sweet_hid_key() slot.
++ *   0  = mediatek,kpd-hw-init-map[0] = 0x72 (KEY_VOLUMEDOWN)
++ *   8  = mediatek,kpd-hw-pwrkey (Android disables it in favour of the
++ *        PMIC path, but the SoC matrix position is still this one)
++ *   17 = mediatek,kpd-hw-dl-key0, the third physical button (volume up)
++ * Anything else is logged raw and ignored.
++ */
++#define SWEET_KEY_POWER 0
++#define SWEET_KEY_VOLUP 1
++#define SWEET_KEY_VOLDN 2
++#define SWEET_KEY_HOME  3
 +
 +static struct {
 +	vm_offset_t kp;
++	vm_offset_t gpio;
++	vm_offset_t iocfg;
 +	bool started;
-+	int state[4]; /* power, vol+, vol-, home */
++	uint16_t state[KPD_NUM_MEMS];
++	int skey[4]; /* power, vol+, vol-, home */
 +} fk;
 +static int fk_sleep_chan;
 +
-+static uint32_t
++/* The keypad block is 16-bit oriented (readw/writew in hal_kpd.c). */
++static uint16_t
 +fk_rd(vm_offset_t base, uint32_t off)
++{
++	uint16_t v = *(volatile uint16_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++fk_wr(vm_offset_t base, uint32_t off, uint16_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint16_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static uint32_t
++fk_rd32(vm_offset_t base, uint32_t off)
 +{
 +	uint32_t v = *(volatile uint32_t *)(base + off);
 +	__asm__ volatile("dmb oshld" ::: "memory");
@@ -83,7 +142,7 @@ index 0000000..33f5665
 +}
 +
 +static void
-+fk_wr(vm_offset_t base, uint32_t off, uint32_t val)
++fk_wr32(vm_offset_t base, uint32_t off, uint32_t val)
 +{
 +	__asm__ volatile("dmb oshst" ::: "memory");
 +	*(volatile uint32_t *)(base + off) = val;
@@ -106,37 +165,97 @@ index 0000000..33f5665
 +	if (key < 0 || key > 3) {
 +		return;
 +	}
-+	if (fk.state[key] == down) {
++	if (fk.skey[key] == down) {
 +		return;
 +	}
-+	fk.state[key] = down;
++	fk.skey[key] = down;
 +	sweet_hid_key(key, down);
 +	printf("SWEET FLEUR KEYS: key %d %s\n", key, down ? "down" : "up");
++}
++
++/* GPIO80 -> function 1 (KPD) plus the DT's bias-pull-up <0x66>. */
++static void
++fk_pinmux(void)
++{
++	uint32_t v;
++
++	v = fk_rd32(fk.gpio, GPIO_MODE(KPD_PIN));
++	v &= ~(0xFu << GPIO_MODE_SH(KPD_PIN));
++	v |= 1u << GPIO_MODE_SH(KPD_PIN);
++	fk_wr32(fk.gpio, GPIO_MODE(KPD_PIN), v);
++
++	v = fk_rd32(fk.iocfg, BM_PUPD);
++	v &= ~(1u << 0);        /* PUPD = 0 -> pull-up */
++	fk_wr32(fk.iocfg, BM_PUPD, v);
++	v = fk_rd32(fk.iocfg, BM_R0);
++	v &= ~(1u << 0);        /* R0 = 0 */
++	fk_wr32(fk.iocfg, BM_R0, v);
++	v = fk_rd32(fk.iocfg, BM_R1);
++	v |= (1u << 0);         /* R1 = 1 */
++	fk_wr32(fk.iocfg, BM_R1, v);
++
++	printf("SWEET FLEUR KEYS: mode80=0x%x pupd=0x%x r0=0x%x r1=0x%x\n",
++	    (fk_rd32(fk.gpio, GPIO_MODE(KPD_PIN)) >> GPIO_MODE_SH(KPD_PIN)) &
++	    0xF, fk_rd32(fk.iocfg, BM_PUPD), fk_rd32(fk.iocfg, BM_R0),
++	    fk_rd32(fk.iocfg, BM_R1));
++}
++
++static void
++fk_get_state(uint16_t *state)
++{
++	unsigned i;
++
++	for (i = 0; i < KPD_NUM_MEMS; ++i) {
++		state[i] = fk_rd(fk.kp, KP_MEM1 + 4u * i);
++	}
++}
++
++/* key slot for a hw keycode, or -1 for "log only". */
++static int
++fk_slot(unsigned hw)
++{
++	switch (hw) {
++	case 0:  return SWEET_KEY_VOLDN;
++	case 8:  return SWEET_KEY_POWER;
++	case 17: return SWEET_KEY_VOLUP;
++	default: return -1;
++	}
 +}
 +
 +static void
 +fk_poll(void)
 +{
-+	uint32_t sta = fk_rd(fk.kp, KP_STA);
-+	int key = -1;
++	uint16_t new_state[KPD_NUM_MEMS];
++	unsigned i, j;
 +
-+	/* KP_STA bit0 = key pressed, keycode in bits 15:8. */
-+	if (sta & 1u) {
-+		switch ((sta >> 8) & 0xFF) {
-+		case KEY_POWER: key = 0; break;
-+		case KEY_VOLUP:  key = 1; break;
-+		case KEY_VOLDN:  key = 2; break;
-+		case KEY_HOME:   key = 3; break;
-+		default: break;
++	fk_get_state(new_state);
++	for (i = 0; i < KPD_NUM_MEMS; ++i) {
++		uint16_t change = new_state[i] ^ fk.state[i];
++
++		if (change == 0) {
++			continue;
++		}
++		for (j = 0; j < 16; ++j) {
++			uint16_t mask = (uint16_t)(1u << j);
++			unsigned hw = (i << 4) + j;
++			int pressed, slot;
++
++			if ((change & mask) == 0) {
++				continue;
++			}
++			/* bit == 0 means pressed (kpd_keymap_handler) */
++			pressed = ((new_state[i] & mask) == 0) ? 1 : 0;
++			slot = fk_slot(hw);
++			if (slot >= 0) {
++				fk_set(slot, pressed);
++			}
++			printf("SWEET FLEUR KEYS: hw %u %s (mem%u=0x%04x "
++			    "%s)\n", hw, pressed ? "down" : "up", i + 1,
++			    new_state[i], slot >= 0 ? "mapped" : "raw");
 +		}
 +	}
-+
-+	if (key >= 0) {
-+		fk_set(key, 1);
-+	} else {
-+		for (int k = 0; k < 4; ++k) {
-+			fk_set(k, 0);
-+		}
++	for (i = 0; i < KPD_NUM_MEMS; ++i) {
++		fk.state[i] = new_state[i];
 +	}
 +}
 +
@@ -148,22 +267,34 @@ index 0000000..33f5665
 +	printf("SWEET FLEUR KEYS: starting (mediatek,kp @0x%08x)\n", KP_BASE);
 +
 +	fk.kp = ml_io_map(KP_BASE, KP_SIZE);
-+	if (fk.kp == 0) {
++	fk.gpio = ml_io_map(GPIO_BASE, GPIO_SIZE);
++	fk.iocfg = ml_io_map(IOCFG_BM_BASE, IOCFG_BM_SIZE);
++	if (fk.kp == 0 || fk.gpio == 0 || fk.iocfg == 0) {
 +		printf("SWEET FLEUR KEYS: MMIO mapping failed\n");
 +		goto out;
 +	}
-+	printf("SWEET FLEUR KEYS: kp @0x%llx\n", (unsigned long long)fk.kp);
-+	if ((fk.kp >> 48) != 0xffffULL) {
++	printf("SWEET FLEUR KEYS: kp @0x%llx gpio @0x%llx iocfg @0x%llx\n",
++	    (unsigned long long)fk.kp, (unsigned long long)fk.gpio,
++	    (unsigned long long)fk.iocfg);
++	if (((fk.kp | fk.gpio | fk.iocfg) >> 48) != 0xffffULL) {
 +		printf("SWEET FLEUR KEYS: mapping is not a kernel address, "
 +		    "leaving the hardware alone\n");
 +		goto out;
 +	}
 +
-+	/* Enable the controller with the DT's debounce value.  These three
-+	 * writes mirror what the Android kpd driver does at probe time. */
-+	fk_wr(fk.kp, KP_DEBOUNCE, 0x400);
++	fk_pinmux();
++
++	/* Same three writes the Android driver does at probe time. */
++	fk_wr(fk.kp, KP_DEBOUNCE, (uint16_t)(0x400u & KP_DEBOUNCE_MASK));
 +	fk_wr(fk.kp, KP_SEL, 0);
 +	fk_wr(fk.kp, KP_EN, 1);
++
++	fk_get_state(fk.state);
++	printf("SWEET FLEUR KEYS: kp_sta=0x%04x mem=0x%04x 0x%04x 0x%04x "
++	    "0x%04x 0x%04x deb=0x%04x en=0x%04x\n",
++	    fk_rd(fk.kp, KP_STA), fk.state[0], fk.state[1], fk.state[2],
++	    fk.state[3], fk.state[4], fk_rd(fk.kp, KP_DEBOUNCE),
++	    fk_rd(fk.kp, KP_EN));
 +
 +	while (1) {
 +		fk_poll();

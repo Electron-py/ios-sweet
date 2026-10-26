@@ -12,22 +12,38 @@ index 6630131..0b14e68 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_fleur_touch.c b/bsd/dev/sweet_fleur_touch.c
 new file mode 100644
-index 0000000..935d49a
+index 0000000..dab8054
 --- /dev/null
 +++ b/bsd/dev/sweet_fleur_touch.c
-@@ -0,0 +1,368 @@
+@@ -0,0 +1,716 @@
 +/*
 + * FLEUR MT6781: MTK I2C + FocalTech FTS touch driver.
 + * Reads touch reports over I2C and feeds them through sweet_hid_touch().
-+ * Hardware facts (from the Android DTB, /home/tom/Documents/musi/fleur.dtb):
-+ *   I2C controller: mediatek,i2c @ 0x11007000 (i2c0)
-+ *   Touch IC:       focaltech,fts @ 0x38 on i2c0
-+ *   IRQ GPIO: 15 (EINT), Reset GPIO: 16, AVDD GPIO: 58
-+ *   10 fingers, display-coords 1080x2400
++ *
++ * Every register address and bit below comes from the MT6781 Android
++ * kernel source on disk (drivers/i2c/busses/i2c-mtk.c + i2c-mtk.h,
++ * drivers/pinctrl/mediatek/pinctrl-mt6781.c), not from guesswork:
++ *
++ *   - The controller is "mediatek,i2c" with i2c_common `ver = [02]`,
++ *     i.e. the V2 register map (SOFTRESET 0x50, IO_CONFIG 0x34,
++ *     LTIMING 0x2c, CLOCK_DIV 0x48, MCU_INTR 0x40 ...).
++ *   - Clocks: infracfg_ao INFRA1 bit 29 (`infra_imp_iic`) and the
++ *     imp_iic_wrap gate bit 0 (`imp_ap_i2c0`), parented on topckgen
++ *     `i2c_sel` (CLK_CFG_6 bits 25:24).  We force it to 0 = clk26m so
++ *     clk_src is deterministically 26MHz/5 = 5.2MHz.
++ *   - GPIO144/145 must be muxed to function 1 (I2C) in the *gpio*
++ *     region mode registers; mode for pin p lives at
++ *     0x300 + 0x10 * (p/8), 4 bits at 4*(p%8).  Pull-up is the
++ *     iocfg_lm PU register (0x10002240) bits 2/4.
++ *   - Transfers are kept <= 8 bytes so the controller stays in FIFO
++ *     mode (mt_i2c_do_transfer only uses DMA above 8 bytes, and DMA
++ *     needs a physical buffer we do not have).
++ *   - FTS reads are write + repeated-start read (msg_num = 2 in
++ *     fts_read()), i.e. I2C_MASTER_WRRD.
 + *
 + * Everything here is opt-in via boot-arg `sweettouch` and runs on a
 + * dedicated kernel thread started from the UFS probe, exactly like
-+ * sweet_touch.c / sweet_keys.c.  A failed I2C transaction only logs once
++ * sweet_touch.c / sweet_keys.c.  A failed I2C transaction only logs
 + * and backs off -- nothing in this file may ever hang the boot.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -45,51 +61,90 @@ index 0000000..935d49a
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
 +void sweet_fleur_touch_init(void);
 +
-+/* MTK I2C controller registers (mediatek,i2c binding) */
-+#define I2C_BASE        0x11007000u
-+#define I2C_SIZE        0x1000u
-+#define I2C_DATA_PORT   0x00u
-+#define I2C_SLAVE_ADDR  0x04u
-+#define I2C_INTR_MASK   0x08u
-+#define I2C_INTR_STAT   0x0Cu
-+#define I2C_CONTROL     0x10u
-+#define I2C_TRANSFER_LEN 0x14u
-+#define I2C_TRANSAC_LEN 0x18u
-+#define I2C_DELAY_LEN   0x1Cu
-+#define I2C_TIMING      0x20u
-+#define I2C_START       0x24u
-+#define I2C_EXT_CONF    0x28u
-+#define I2C_FIFO_STAT   0x30u
-+#define I2C_FIFO_THRESH 0x34u
-+#define I2C_FIFO_ADDR_CLR 0x38u
-+#define I2C_IO_CONFIG   0x40u
-+#define I2C_HS          0x44u
-+#define I2C_SOFT_RST    0x48u
++/* --- MTK I2C ver-2 register map (i2c-mtk.h enum V2_OFFSET_*) --- */
++#define I2C_BASE                0x11007000u
++#define I2C_SIZE                0x1000u
++#define I2C_DATA_PORT           0x00u
++#define I2C_SLAVE_ADDR          0x04u
++#define I2C_INTR_MASK           0x08u
++#define I2C_INTR_STAT           0x0Cu
++#define I2C_CONTROL             0x10u
++#define I2C_TRANSFER_LEN        0x14u
++#define I2C_TRANSAC_LEN         0x18u
++#define I2C_DELAY_LEN           0x1Cu
++#define I2C_TIMING              0x20u
++#define I2C_START               0x24u
++#define I2C_EXT_CONF            0x28u
++#define I2C_LTIMING             0x2Cu
++#define I2C_HS                  0x30u
++#define I2C_IO_CONFIG           0x34u
++#define I2C_FIFO_ADDR_CLR       0x38u
++#define I2C_MCU_INTR            0x40u
++#define I2C_TRANSFER_LEN_AUX    0x44u
++#define I2C_CLOCK_DIV           0x48u
++#define I2C_HW_TIMEOUT          0x4Cu
++#define I2C_SOFTRESET           0x50u
++#define I2C_DEBUGSTAT           0xE4u
++#define I2C_FIFO_STAT           0xF4u
 +
-+#define I2C_CTRL_ACKERR_DET_EN  (1u << 0)
-+#define I2C_CTRL_DIR_CHANGE     (1u << 1)
-+#define I2C_CTRL_RS             (1u << 4)
-+#define I2C_CTRL_MASTER         (1u << 12)
++/* CONTROL bits */
++#define I2C_CTRL_RS             (1u << 1)
++#define I2C_CTRL_CLK_EXT_EN     (1u << 3)
++#define I2C_CTRL_DIR_CHANGE     (1u << 4)
++#define I2C_CTRL_ACKERR_DET_EN  (1u << 5)
 +
-+#define I2C_STAT_ACKERR         (1u << 0)
-+#define I2C_STAT_NACK           (1u << 1)
-+#define I2C_STAT_ARB_LOST       (1u << 2)
-+#define I2C_STAT_TRANSFER_DONE  (1u << 6)
++/* INTR_STAT bits */
++#define I2C_ST_COMP             (1u << 0)
++#define I2C_ST_ACKERR           (1u << 1)
++#define I2C_ST_HS_NACKERR       (1u << 2)
++#define I2C_ST_ARB_LOST         (1u << 3)
++#define I2C_ST_TIMEOUT          (1u << 5)
++#define I2C_ST_BUS_ERR          (1u << 8)
++#define I2C_INTR_ALL            0x1FFu
++/* int_reg as computed by mt_i2c_do_transfer() for ver == 0x2 */
++#define I2C_INT_MASK            (I2C_ST_COMP | I2C_ST_ACKERR | \
++    I2C_ST_HS_NACKERR | I2C_ST_ARB_LOST | I2C_ST_TIMEOUT | I2C_ST_BUS_ERR)
++#define I2C_BAD_BITS            (I2C_ST_ACKERR | I2C_ST_HS_NACKERR | \
++    I2C_ST_ARB_LOST | I2C_ST_TIMEOUT | I2C_ST_BUS_ERR)
 +
-+/* MTK GPIO controller registers: *offsets* from GPIO_BASE.  ft_rd/ft_wr add
-+ * the base themselves, so these must not carry it -- with the base in both
-+ * places the access went to 2 * base + off and killed the kernel. */
-+#define GPIO_BASE       0x10005000u
-+#define GPIO_SIZE       0x2000u
-+#define GPIO_DIR_SET(pin)   (0x200u * ((pin) / 32) + 0x04u)
-+#define GPIO_DIR_CLR(pin)   (0x200u * ((pin) / 32) + 0x08u)
-+#define GPIO_DOUT_SET(pin)  (0x200u * ((pin) / 32) + 0x14u)
-+#define GPIO_DOUT_CLR(pin)  (0x200u * ((pin) / 32) + 0x18u)
-+#define GPIO_DIN(pin)       (0x200u * ((pin) / 32) + 0x20u)
-+#define GPIO_MODE(pin)      (0x1000u + 0x40u * (pin))
++/* Init constants (i2c-mtk.h) */
++#define I2C_SOFT_RST_VAL        0x0001u
++#define I2C_IO_OPEN_DRAIN       0x0003u
++#define I2C_DELAY_LEN_VAL       0x000Au
++#define I2C_TIMEOUT_EN          0x0001u
++#define I2C_MCU_INTR_EN         0x0001u
++#define I2C_EXT_TIME_CONFIG     0x0118u  /* i2c_common ext_time_config */
++#define I2C_CLK_SRC_DIV         5u       /* i2c0 clock-div */
++#define I2C_MAX_FIFO            8u       /* DMA kicks in above this */
 +
-+#define GPIO_MODE_GPIO  0x0
-+#define GPIO_PULL_UP    0x1
++/* --- GPIO region: DIR/DOUT/DIN/MODE (pinctrl-mt6781.c _range tables) --- */
++#define GPIO_BASE               0x10005000u
++#define GPIO_SIZE               0x1000u
++#define GPIO_DIR(pin)           (0x000u + 0x10u * ((pin) / 32))
++#define GPIO_DIR_SET(pin)       (GPIO_DIR(pin) + 0x04u)
++#define GPIO_DIR_CLR(pin)       (GPIO_DIR(pin) + 0x08u)
++#define GPIO_DOUT(pin)          (0x100u + 0x10u * ((pin) / 32))
++#define GPIO_DOUT_SET(pin)      (GPIO_DOUT(pin) + 0x04u)
++#define GPIO_DOUT_CLR(pin)      (GPIO_DOUT(pin) + 0x08u)
++#define GPIO_DIN(pin)           (0x200u + 0x10u * ((pin) / 32))
++#define GPIO_MODE(pin)          (0x300u + 0x10u * ((pin) / 8))
++#define GPIO_MODE_SH(pin)       (4u * ((pin) % 8))
++
++/* --- clock gating / pinmux bases --- */
++#define INFRACFG_BASE           0x10001000u
++#define INFRA1_CG_SET           0x88u   /* infra_imp_iic = INFRA1 bit 29 */
++#define INFRA1_CG_STA           0x94u
++#define IMP_IIC_BASE            0x11017000u
++#define IMP_CG_SET              0xE08u  /* imp_ap_i2c0 = gate bit 0 */
++#define IMP_CG_STA              0xE00u
++#define TOPCK_BASE              0x10000000u
++#define TOP_CLK_CFG_6           0xA0u   /* i2c_sel, bits 25:24 */
++#define TOP_CLK_CFG_6_CLR       0xA8u
++#define TOP_CLK_UPDATE          0x004u  /* update bit 27 */
++#define IOCFG_LM_BASE           0x10002200u  /* pins 144/145 live here */
++#define IOCFG_LM_SIZE           0x200u
++#define IOCFG_PU                0x40u   /* pin144 = bit 2, pin145 = bit 4 */
++#define IOCFG_PD                0x30u
 +
 +/* FocalTech FTS registers */
 +#define FTS_ADDR        0x38u
@@ -98,7 +153,6 @@ index 0000000..935d49a
 +#define FTS_POINT_LEN   6u
 +#define FTS_ID_REG      0xA3u
 +#define FTS_CTRL_REG    0x86u
-+#define FTS_SYS_RESET   0x01u
 +
 +#define TOUCH_IRQ_GPIO  15
 +#define TOUCH_RST_GPIO  16
@@ -107,15 +161,29 @@ index 0000000..935d49a
 +static struct {
 +	vm_offset_t i2c;
 +	vm_offset_t gpio;
++	vm_offset_t iocfg;
++	vm_offset_t infracfg;
++	vm_offset_t imp;
++	vm_offset_t topck;
 +	bool started;
 +	bool dead;
 +	bool warned;
++	unsigned polls;
++	uint16_t timing;
++	uint16_t ltiming;
++	/* one-shot failure diagnostics */
++	uint16_t f_stat;
++	uint16_t f_dbg;
++	uint16_t f_fifo;
++	uint16_t f_ctl;
++	unsigned fails;
 +	int x[FTS_MAX_FINGERS];
 +	int y[FTS_MAX_FINGERS];
 +	bool down[FTS_MAX_FINGERS];
 +} ft;
 +static int ft_sleep_chan;
 +
++/* 32-bit accesses for GPIO / clock / pinctrl blocks (readl/writel). */
 +static uint32_t
 +ft_rd(vm_offset_t base, vm_offset_t off)
 +{
@@ -129,6 +197,23 @@ index 0000000..935d49a
 +{
 +	__asm__ volatile("dmb oshst" ::: "memory");
 +	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* The I2C block is 16-bit oriented: the kernel uses readw/writew. */
++static uint16_t
++ft_rd16(vm_offset_t base, vm_offset_t off)
++{
++	uint16_t v = *(volatile uint16_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++ft_wr16(vm_offset_t base, vm_offset_t off, uint16_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint16_t *)(base + off) = val;
 +	__asm__ volatile("dsb osh" ::: "memory");
 +}
 +
@@ -148,29 +233,29 @@ index 0000000..935d49a
 +}
 +
 +static void
-+ft_gpio_mode(unsigned pin, unsigned mode)
++ft_mode(unsigned pin, unsigned mode)
 +{
-+	ft_wr(ft.gpio, GPIO_MODE(pin), mode);
++	uint32_t reg = GPIO_MODE(pin);
++	uint32_t sh = GPIO_MODE_SH(pin);
++	uint32_t v = ft_rd(ft.gpio, reg);
++
++	v &= ~(0xFu << sh);
++	v |= (mode & 0xFu) << sh;
++	ft_wr(ft.gpio, reg, v);
 +}
 +
 +static void
 +ft_gpio_dir(unsigned pin, bool out)
 +{
-+	if (out) {
-+		ft_wr(ft.gpio, GPIO_DIR_SET(pin), 1u << (pin % 32));
-+	} else {
-+		ft_wr(ft.gpio, GPIO_DIR_CLR(pin), 1u << (pin % 32));
-+	}
++	ft_wr(ft.gpio, out ? GPIO_DIR_SET(pin) : GPIO_DIR_CLR(pin),
++	    1u << (pin % 32));
 +}
 +
 +static void
 +ft_gpio_write(unsigned pin, bool high)
 +{
-+	if (high) {
-+		ft_wr(ft.gpio, GPIO_DOUT_SET(pin), 1u << (pin % 32));
-+	} else {
-+		ft_wr(ft.gpio, GPIO_DOUT_CLR(pin), 1u << (pin % 32));
-+	}
++	ft_wr(ft.gpio, high ? GPIO_DOUT_SET(pin) : GPIO_DOUT_CLR(pin),
++	    1u << (pin % 32));
 +}
 +
 +static bool
@@ -179,51 +264,234 @@ index 0000000..935d49a
 +	return (ft_rd(ft.gpio, GPIO_DIN(pin)) >> (pin % 32)) & 1u;
 +}
 +
++/*
++ * Speed setup, ported verbatim from i2c-mtk.c: mtk_i2c_calculate_speed()
++ * with cnt_constraint set (i2c_common cnt_constraint = [01]) and duty 45/55
++ * (DUTY_CYCLE / 100 - DUTY_CYCLE) for set_ltiming.
++ */
 +static int
-+ft_i2c_wait_done(void)
++ft_calc_speed(unsigned clk_src, unsigned speed_hz, unsigned *step,
++    unsigned *sample)
 +{
-+	for (unsigned i = 0; i < 20000; ++i) {
-+		uint32_t stat = ft_rd(ft.i2c, I2C_INTR_STAT);
++	unsigned khz = speed_hz / 1000;
++	unsigned hclk = clk_src / 1000;
++	unsigned max_step, sample_div = 8, step_div, min_div, best_mul;
++	unsigned s, st, mul;
 +
-+		if (stat & I2C_STAT_TRANSFER_DONE) {
-+			ft_wr(ft.i2c, I2C_INTR_STAT, stat);
-+			return 0;
++	if (speed_hz > 400000u * 8) {
++		max_step = 8;   /* MAX_HS_STEP_CNT_DIV */
++	} else if (speed_hz > 400000u) {
++		max_step = 8;
++	} else {
++		max_step = 64;  /* MAX_STEP_CNT_DIV */
++	}
++	if (khz == 0) {
++		return -1;
++	}
++	min_div = ((hclk >> 1) + khz - 1) / khz;
++	best_mul = 8 * max_step;
++	step_div = max_step;
++	for (s = 1; s <= 8; ++s) {
++		st = (min_div + s - 1) / s;
++		mul = st * s;
++		if (st > max_step) {
++			continue;
 +		}
-+		if (stat & (I2C_STAT_ACKERR | I2C_STAT_NACK | I2C_STAT_ARB_LOST)) {
-+			ft_wr(ft.i2c, I2C_INTR_STAT, stat);
-+			return -1;
++		if (mul < best_mul) {
++			best_mul = mul;
++			sample_div = s;
++			step_div = st;
++			if (best_mul == min_div) {
++				break;
++			}
++		}
++	}
++	s = sample_div;
++	st = step_div;
++	if (hclk / (2 * s * st) > khz) {
++		return -1;
++	}
++	/* cnt_constraint: --sample_cnt == 0 leaves step_cnt alone */
++	if (--s != 0) {
++		st--;
++	}
++	*step = st;
++	*sample = s;
++	return 0;
++}
++
++static void
++ft_i2c_speed_setup(void)
++{
++	unsigned clk_src = 26000000u / I2C_CLK_SRC_DIV; /* clk26m / 5 */
++	unsigned step = 0, sample = 0, lstep = 0, lsample = 0;
++	unsigned tv, tv1, tv2;
++
++	/* duty = DUTY_CYCLE (45) because 100k < 400k <= FS and set_ltiming */
++	if (ft_calc_speed(clk_src, (400000u * 50u) / 45u, &step, &sample) != 0) {
++		step = 6;
++		sample = 0;
++	}
++	if (ft_calc_speed(clk_src, (400000u * 50u) / 55u, &lstep, &lsample) != 0) {
++		lstep = 8;
++		lsample = 0;
++	}
++	ft.timing = (uint16_t)((sample << 8) | step);
++	ft.ltiming = (uint16_t)((lsample << 6) | lstep);
++
++	/* SCL low timeout register, same formula as mt_i2c_do_transfer() */
++	tv1 = (clk_src / 1000) * 2;            /* MAX_SCL_LOW_TIME = 2 ms */
++	tv2 = (((ft.ltiming & 0x3Fu) + 1) *
++	    (((ft.ltiming & 0x1C0u) >> 6) + 1));
++	tv = tv2 ? ((tv1 + tv2 - 1) / tv2) : 0;
++	ft_wr16(ft.i2c, I2C_HW_TIMEOUT, (uint16_t)(tv & 0xFFFFu));
++
++	/* set_dt_div: ((div - 1) << 8) + (div - 1) */
++	ft_wr16(ft.i2c, I2C_CLOCK_DIV,
++	    (uint16_t)(((I2C_CLK_SRC_DIV - 1) << 8) + (I2C_CLK_SRC_DIV - 1)));
++}
++
++/* mt_i2c_init_hw(), ver 2 / FIFO / open-drain. */
++static void
++ft_i2c_init_hw(void)
++{
++	uint16_t stat;
++
++	ft_wr16(ft.i2c, I2C_INTR_MASK, 0);
++	stat = ft_rd16(ft.i2c, I2C_INTR_STAT);
++	ft_wr16(ft.i2c, I2C_INTR_STAT, stat);
++	ft_wr16(ft.i2c, I2C_SOFTRESET, I2C_SOFT_RST_VAL);
++	ft_wr16(ft.i2c, I2C_IO_CONFIG, I2C_IO_OPEN_DRAIN);
++	ft_i2c_speed_setup();
++	ft_wr16(ft.i2c, I2C_TIMING, (uint16_t)(ft.timing | I2C_TIMEOUT_EN));
++	ft_wr16(ft.i2c, I2C_LTIMING, ft.ltiming);
++	ft_wr16(ft.i2c, I2C_HS, 0);
++	ft_wr16(ft.i2c, I2C_CONTROL,
++	    (uint16_t)(I2C_CTRL_ACKERR_DET_EN | I2C_CTRL_CLK_EXT_EN));
++	ft_wr16(ft.i2c, I2C_EXT_CONF, I2C_EXT_TIME_CONFIG);
++	ft_wr16(ft.i2c, I2C_DELAY_LEN, I2C_DELAY_LEN_VAL);
++}
++
++static void
++ft_note_fail(uint16_t stat)
++{
++	ft.fails++;
++	if (ft.fails == 1 || (ft.fails % 200) == 0) {
++		printf("SWEET FLEUR TOUCH: I2C fail #%u stat=0x%04x "
++		    "ctl=0x%04x dbg=0x%04x fifo=0x%04x (fifo_stat/st)\n",
++		    ft.fails, stat, ft_rd16(ft.i2c, I2C_CONTROL),
++		    ft_rd16(ft.i2c, I2C_DEBUGSTAT),
++		    ft_rd16(ft.i2c, I2C_FIFO_STAT));
++	}
++	ft.f_stat = stat;
++	ft.f_ctl = ft_rd16(ft.i2c, I2C_CONTROL);
++	ft.f_dbg = ft_rd16(ft.i2c, I2C_DEBUGSTAT);
++	ft.f_fifo = ft_rd16(ft.i2c, I2C_FIFO_STAT);
++}
++
++/*
++ * One FIFO transaction.  wlen/rlen are both limited to I2C_MAX_FIFO so the
++ * controller never reaches for DMA.  A read is the FTS write+repeated-start
++ * read (WRRD); a read with no command byte is a plain read.
++ */
++static int
++ft_i2c_xfer(const uint8_t *w, unsigned wlen, uint8_t *r, unsigned rlen)
++{
++	uint16_t ctrl, addr, stat = 0;
++	unsigned i;
++
++	if (wlen > I2C_MAX_FIFO || rlen > I2C_MAX_FIFO) {
++		return -1;
++	}
++	ctrl = I2C_CTRL_ACKERR_DET_EN | I2C_CTRL_CLK_EXT_EN;
++	if (wlen && rlen) {
++		ctrl |= I2C_CTRL_DIR_CHANGE | I2C_CTRL_RS;
++	}
++	addr = (uint16_t)(FTS_ADDR << 1);
++	if (!wlen && rlen) {
++		addr |= 1u;
++	}
++
++	ft_wr16(ft.i2c, I2C_CONTROL, ctrl);
++	ft_wr16(ft.i2c, I2C_EXT_CONF, I2C_EXT_TIME_CONFIG);
++	ft_wr16(ft.i2c, I2C_DELAY_LEN, I2C_DELAY_LEN_VAL);
++	ft_wr16(ft.i2c, I2C_IO_CONFIG, I2C_IO_OPEN_DRAIN);
++	ft_wr16(ft.i2c, I2C_TIMING, (uint16_t)(ft.timing | I2C_TIMEOUT_EN));
++	ft_wr16(ft.i2c, I2C_LTIMING, ft.ltiming);
++	ft_wr16(ft.i2c, I2C_HS, 0);
++	ft_wr16(ft.i2c, I2C_SLAVE_ADDR, addr);
++	ft_wr16(ft.i2c, I2C_INTR_STAT, (uint16_t)I2C_INTR_ALL);
++	ft_wr16(ft.i2c, I2C_FIFO_ADDR_CLR, 1);
++	ft_wr16(ft.i2c, I2C_INTR_MASK, (uint16_t)I2C_INT_MASK);
++
++	if (wlen && rlen) {
++		ft_wr16(ft.i2c, I2C_TRANSFER_LEN, (uint16_t)wlen);
++		ft_wr16(ft.i2c, I2C_TRANSFER_LEN_AUX, (uint16_t)rlen);
++		ft_wr16(ft.i2c, I2C_TRANSAC_LEN, 2);
++	} else {
++		ft_wr16(ft.i2c, I2C_TRANSFER_LEN,
++		    (uint16_t)(wlen ? wlen : rlen));
++		ft_wr16(ft.i2c, I2C_TRANSAC_LEN, 1);
++	}
++
++	for (i = 0; i < wlen; ++i) {
++		ft_wr16(ft.i2c, I2C_DATA_PORT, w[i]);
++	}
++	ft_wr16(ft.i2c, I2C_MCU_INTR, I2C_MCU_INTR_EN);
++	ft_wr16(ft.i2c, I2C_START, 1);
++
++	for (i = 0; i < 40000; ++i) {
++		stat = ft_rd16(ft.i2c, I2C_INTR_STAT);
++		if (stat & I2C_INT_MASK) {
++			break;
 +		}
 +		delay(1);
 +	}
-+	return -1;
++	if (!(stat & I2C_ST_COMP) || (stat & I2C_BAD_BITS)) {
++		ft_note_fail(stat);
++		ft_wr16(ft.i2c, I2C_INTR_STAT, (uint16_t)I2C_INTR_ALL);
++		return -1;
++	}
++	for (i = 0; i < rlen; ++i) {
++		r[i] = (uint8_t)(ft_rd16(ft.i2c, I2C_DATA_PORT) & 0xFF);
++	}
++	ft_wr16(ft.i2c, I2C_INTR_STAT, (uint16_t)I2C_INTR_ALL);
++	return 0;
 +}
 +
++/* Chunked read: FIFO mode caps us at 8 bytes per transaction. */
 +static int
 +ft_i2c_read(uint8_t reg, uint8_t *data, unsigned len)
 +{
-+	/* Write the register address, then repeated-start into a read. */
-+	ft_wr(ft.i2c, I2C_SLAVE_ADDR, FTS_ADDR << 1);
-+	ft_wr(ft.i2c, I2C_DATA_PORT, reg);
-+	ft_wr(ft.i2c, I2C_TRANSFER_LEN, 1);
-+	ft_wr(ft.i2c, I2C_TRANSAC_LEN, 1);
-+	ft_wr(ft.i2c, I2C_CONTROL, I2C_CTRL_MASTER | I2C_CTRL_DIR_CHANGE |
-+	    I2C_CTRL_ACKERR_DET_EN | I2C_CTRL_RS);
-+	ft_wr(ft.i2c, I2C_START, 1);
-+	if (ft_i2c_wait_done() != 0) {
-+		return -1;
-+	}
-+	ft_wr(ft.i2c, I2C_SLAVE_ADDR, (FTS_ADDR << 1) | 1);
-+	ft_wr(ft.i2c, I2C_TRANSFER_LEN, len);
-+	ft_wr(ft.i2c, I2C_TRANSAC_LEN, 1);
-+	ft_wr(ft.i2c, I2C_CONTROL, I2C_CTRL_MASTER | I2C_CTRL_ACKERR_DET_EN);
-+	ft_wr(ft.i2c, I2C_START, 1);
-+	if (ft_i2c_wait_done() != 0) {
-+		return -1;
-+	}
-+	for (unsigned i = 0; i < len; ++i) {
-+		data[i] = (uint8_t)ft_rd(ft.i2c, I2C_DATA_PORT);
++	unsigned done = 0;
++
++	while (done < len) {
++		unsigned n = len - done;
++		uint8_t tmp[8];
++
++		if (n > 8) {
++			n = 8;
++		}
++		if (ft_i2c_xfer(&reg, 1, tmp, n) != 0) {
++			return -1;
++		}
++		for (unsigned i = 0; i < n; ++i) {
++			data[done + i] = tmp[i];
++		}
++		done += n;
++		reg = (uint8_t)(reg + n);
 +	}
 +	return 0;
++}
++
++static int
++ft_i2c_write(uint8_t reg, uint8_t val)
++{
++	uint8_t buf[2];
++
++	buf[0] = reg;
++	buf[1] = val;
++	return ft_i2c_xfer(buf, 2, NULL, 0);
 +}
 +
 +static void
@@ -284,10 +552,58 @@ index 0000000..935d49a
 +	}
 +}
 +
++/* Enable the I2C clock chain and force i2c_sel onto clk26m. */
++static void
++ft_clocks_on(void)
++{
++	uint32_t sel;
++
++	ft_wr(ft.infracfg, INFRA1_CG_SET, 1u << 29);
++	ft_wr(ft.imp, IMP_CG_SET, 1u << 0);
++
++	sel = (ft_rd(ft.topck, TOP_CLK_CFG_6) >> 24) & 0x3u;
++	if (sel != 0) {
++		/* write-1-to-clear the 2-bit field, then pulse update bit 27 */
++		ft_wr(ft.topck, TOP_CLK_CFG_6_CLR, 0x3u << 24);
++		ft_wr(ft.topck, TOP_CLK_UPDATE, 1u << 27);
++	}
++	printf("SWEET FLEUR TOUCH: cg infra1=0x%08x imp=0x%08x "
++	    "i2c_sel %u->%u\n",
++	    ft_rd(ft.infracfg, INFRA1_CG_STA),
++	    ft_rd(ft.imp, IMP_CG_STA), sel,
++	    (ft_rd(ft.topck, TOP_CLK_CFG_6) >> 24) & 0x3u);
++}
++
++/* Mux GPIO144/145 to I2C (fn 1) and give them pull-ups. */
++static void
++ft_pins_i2c(void)
++{
++	uint32_t v;
++
++	v = ft_rd(ft.gpio, GPIO_MODE(144));
++	v &= ~(0xFu << GPIO_MODE_SH(144));
++	v |= 1u << GPIO_MODE_SH(144);
++	v &= ~(0xFu << GPIO_MODE_SH(145));
++	v |= 1u << GPIO_MODE_SH(145);
++	ft_wr(ft.gpio, GPIO_MODE(144), v);
++
++	v = ft_rd(ft.iocfg, IOCFG_PU);
++	v |= (1u << 2) | (1u << 4);
++	ft_wr(ft.iocfg, IOCFG_PU, v);
++	v = ft_rd(ft.iocfg, IOCFG_PD);
++	v &= ~((1u << 2) | (1u << 4));
++	ft_wr(ft.iocfg, IOCFG_PD, v);
++
++	printf("SWEET FLEUR TOUCH: mode144=0x%08x pu=0x%08x pd=0x%08x\n",
++	    ft_rd(ft.gpio, GPIO_MODE(144)),
++	    ft_rd(ft.iocfg, IOCFG_PU), ft_rd(ft.iocfg, IOCFG_PD));
++}
++
 +static void
 +ft_thread(void *arg, wait_result_t result)
 +{
 +	uint8_t id = 0;
++	unsigned boot_try = 0;
 +
 +	(void)arg;
 +	(void)result;
@@ -297,59 +613,91 @@ index 0000000..935d49a
 +
 +	ft.i2c = ml_io_map(I2C_BASE, I2C_SIZE);
 +	ft.gpio = ml_io_map(GPIO_BASE, GPIO_SIZE);
-+	if (ft.i2c == 0 || ft.gpio == 0) {
++	ft.iocfg = ml_io_map(IOCFG_LM_BASE, IOCFG_LM_SIZE);
++	ft.infracfg = ml_io_map(INFRACFG_BASE, 0x1000u);
++	ft.imp = ml_io_map(IMP_IIC_BASE, 0x1000u);
++	ft.topck = ml_io_map(TOPCK_BASE, 0x1000u);
++	if (ft.i2c == 0 || ft.gpio == 0 || ft.iocfg == 0 || ft.infracfg == 0 ||
++	    ft.imp == 0 || ft.topck == 0) {
 +		printf("SWEET FLEUR TOUCH: MMIO mapping failed\n");
 +		goto out;
 +	}
-+	printf("SWEET FLEUR TOUCH: i2c @0x%llx, gpio @0x%llx\n",
-+	    (unsigned long long)ft.i2c, (unsigned long long)ft.gpio);
-+	if (((ft.i2c | ft.gpio) >> 48) != 0xffffULL) {
++	printf("SWEET FLEUR TOUCH: i2c @0x%llx gpio @0x%llx "
++	    "iocfg @0x%llx\n", (unsigned long long)ft.i2c,
++	    (unsigned long long)ft.gpio, (unsigned long long)ft.iocfg);
++	if (((ft.i2c | ft.gpio | ft.iocfg | ft.infracfg | ft.imp | ft.topck)
++	    >> 48) != 0xffffULL) {
 +		printf("SWEET FLEUR TOUCH: mapping is not a kernel address, "
 +		    "leaving the hardware alone\n");
 +		goto out;
 +	}
 +
-+	/* IRQ: input with pull-up.  RST/AVDD: outputs. */
-+	ft_gpio_mode(TOUCH_IRQ_GPIO, GPIO_MODE_GPIO);
++	/* Before-state: what LK left behind (vendor gpio_init_default). */
++	printf("SWEET FLEUR TOUCH: mode pre 15=0x%x 16=0x%x 58=0x%x "
++	    "144=0x%08x cfg6=0x%08x\n",
++	    (ft_rd(ft.gpio, GPIO_MODE(15)) >> GPIO_MODE_SH(15)) & 0xF,
++	    (ft_rd(ft.gpio, GPIO_MODE(16)) >> GPIO_MODE_SH(16)) & 0xF,
++	    (ft_rd(ft.gpio, GPIO_MODE(58)) >> GPIO_MODE_SH(58)) & 0xF,
++	    ft_rd(ft.gpio, GPIO_MODE(144)), ft_rd(ft.topck, TOP_CLK_CFG_6));
++
++	/* IRQ/RST/AVDD must be plain GPIOs (vendor default: fn 0). */
++	ft_mode(TOUCH_IRQ_GPIO, 0);
++	ft_mode(TOUCH_RST_GPIO, 0);
++	ft_mode(TOUCH_AVDD_GPIO, 0);
 +	ft_gpio_dir(TOUCH_IRQ_GPIO, FALSE);
-+	ft_wr(ft.gpio, GPIO_MODE(TOUCH_IRQ_GPIO),
-+	    (ft_rd(ft.gpio, GPIO_MODE(TOUCH_IRQ_GPIO)) & ~0x3u) |
-+	    GPIO_PULL_UP);
-+
-+	ft_gpio_mode(TOUCH_RST_GPIO, GPIO_MODE_GPIO);
 +	ft_gpio_dir(TOUCH_RST_GPIO, TRUE);
-+	ft_gpio_write(TOUCH_RST_GPIO, FALSE);
-+
-+	ft_gpio_mode(TOUCH_AVDD_GPIO, GPIO_MODE_GPIO);
 +	ft_gpio_dir(TOUCH_AVDD_GPIO, TRUE);
-+	ft_gpio_write(TOUCH_AVDD_GPIO, TRUE);
-+	ft_wait(10);
++	ft_gpio_write(TOUCH_RST_GPIO, FALSE);
++	ft_gpio_write(TOUCH_AVDD_GPIO, FALSE);
++
++	ft_clocks_on();
++	ft_pins_i2c();
++
++	printf("SWEET FLEUR TOUCH: mode post 15=0x%x 16=0x%x 58=0x%x "
++	    "144=0x%08x\n",
++	    (ft_rd(ft.gpio, GPIO_MODE(15)) >> GPIO_MODE_SH(15)) & 0xF,
++	    (ft_rd(ft.gpio, GPIO_MODE(16)) >> GPIO_MODE_SH(16)) & 0xF,
++	    (ft_rd(ft.gpio, GPIO_MODE(58)) >> GPIO_MODE_SH(58)) & 0xF,
++	    ft_rd(ft.gpio, GPIO_MODE(144)));
 +
 +	/* Power the panel touch rail, then pulse reset. */
++	ft_gpio_write(TOUCH_AVDD_GPIO, TRUE);
++	ft_wait(10);
 +	ft_gpio_write(TOUCH_RST_GPIO, FALSE);
 +	ft_wait(5);
 +	ft_gpio_write(TOUCH_RST_GPIO, TRUE);
 +	ft_wait(50);
 +
-+	/* Soft-reset the I2C block and set a conservative standard-mode
-+	 * clock divider.  Wrong timing only means NAKs, never a panic. */
-+	ft_wr(ft.i2c, I2C_SOFT_RST, 1);
-+	ft_wait(1);
-+	ft_wr(ft.i2c, I2C_SOFT_RST, 0);
-+	ft_wr(ft.i2c, I2C_TIMING, 0x00C800C8);
-+	ft_wr(ft.i2c, I2C_CONTROL, I2C_CTRL_MASTER | I2C_CTRL_ACKERR_DET_EN);
-+	ft_wr(ft.i2c, I2C_INTR_MASK, 0);
++	ft_i2c_init_hw();
++	printf("SWEET FLEUR TOUCH: timing=0x%04x ltiming=0x%04x "
++	    "ctl=0x%04x div=0x%04x io=0x%04x intr=0x%04x dbg=0x%04x\n",
++	    ft_rd16(ft.i2c, I2C_TIMING), ft_rd16(ft.i2c, I2C_LTIMING),
++	    ft_rd16(ft.i2c, I2C_CONTROL), ft_rd16(ft.i2c, I2C_CLOCK_DIV),
++	    ft_rd16(ft.i2c, I2C_IO_CONFIG), ft_rd16(ft.i2c, I2C_INTR_STAT),
++	    ft_rd16(ft.i2c, I2C_DEBUGSTAT));
 +
 +	if (ft_i2c_read(FTS_ID_REG, &id, 1) == 0) {
 +		printf("SWEET FLEUR TOUCH: chip ID 0x%02x\n", id);
 +	} else {
-+		printf("SWEET FLEUR TOUCH: no answer from FTS yet (will keep polling)\n");
++		printf("SWEET FLEUR TOUCH: no answer from FTS yet "
++		    "(will keep polling)\n");
 +	}
 +
++	/*
++	 * Re-arm the controller a couple of times: the chip needs its reset
++	 * window and the bus may settle late.  Diagnostics are printed by
++	 * ft_note_fail() on the first failure only.
++	 */
 +	while (!ft.dead) {
-+		if (!ft_gpio_read(TOUCH_IRQ_GPIO) || ft.down[0] || ft.down[1]) {
-+			ft_read_points();
++		if (boot_try > 0 && (boot_try % 50) == 0) {
++			if (id == 0 && ft_i2c_read(FTS_ID_REG, &id, 1) == 0) {
++				printf("SWEET FLEUR TOUCH: chip ID 0x%02x "
++				    "after %u tries\n", id, boot_try);
++			}
 +		}
++		boot_try++;
++		/* Always poll: the INT line may never assert if mismuxed. */
++		ft_read_points();
 +		ft_wait(10);
 +	}
 +
