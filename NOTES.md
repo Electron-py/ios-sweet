@@ -23,7 +23,7 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 - iOS root = HFS+ in `userdata` partition (LUN 2)
 - Ring buffer at `0x1dc9bf7000` (4 MiB, header `SWEETLOG`)
 
-## Current state (2026-10-26, updated 19:30)
+## Current state (2026-10-26, updated 20:30)
 
 ### ✅ Working
 - Full 8-core boot (`cpus=8`)
@@ -44,14 +44,21 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
   `kern_exec.c`; the only "skipped patch" lines are the pre-existing
   `dxb/patches/*` set)
 - **Patch 0085 KP_SEL/KP_EN fix** — commit `38f5340`, CI run **40381465166**
-  dispatched (build pending)
+  **green** (patches 0080–0086 all applied, `shim-fleur-touchkeys6.img`)
+- **Ring tk6 answers three questions** (`/tmp/opencode/ring-tk6.txt`, 4666
+  lines): I2C+FTS **do** work (`chip ID 0xb1`, zero `I2C fail`), patch 0086
+  **does** mute the console (`SWEET console: muted on SpringBoard exec`), and
+  the keypad now leaves `KP_SEL/KP_EN` untouched (`before` == `after`) with
+  27 presses → 27 × `key 2 down` (slot 2 = VolumeDecrement, correct)
+- **Touch point-count byte fixed** (0084) — commit `ce4747b`, CI run
+  **40394561768** dispatched, build pending
 - **CI build green** (run 40203488333, macos-14, Xcode 15.4)
 
 ### ⚠️ Missing (blockers for "usable")
 | Feature | Hardware | What's needed |
 |---------|----------|---------------|
-| **Touch** | FocalTech FTS, I2C, IRQ=15, RST=16, AVDD=58 | clock-gate polarity fixed (0084) — **boot test pending** |
-| **Buttons** | MT6781 keypad matrix (GPIO80), PMIC power | KP_SEL/KP_EN no longer written (0085) — **boot test pending** |
+| **Touch** | FocalTech FTS, I2C, IRQ=15, RST=16, AVDD=58 | point-count byte moved to the vendor's (`buf[1]`, commit `ce4747b`) — **boot test pending**; the delivery path (0058 `SweetHIDTouch`) has still never been proven end-to-end |
+| **Buttons** | MT6781 keypad matrix (GPIO80), PMIC power | volume-down **delivered** (tk6: 27 presses → 27 events, correct slot); power + volume-up are MT6358 **PMIC** keys → need the read-only PWRAP driver; HakiOS two-look filter still to add |
 | **Background/wallpaper** | CPU renderer path (no GPU) | QuartzCore CPU renderer + wallpaper service |
 | **bluetoothd/fairplayd respawn** (83×) | root image | 3 hand-fixes lost in the v3 25 GiB rebuild — see below |
 
@@ -187,6 +194,82 @@ still in the persistent ring, and `panic_active()` still draws a panic.
 (`exec SpringBoard`, `exec xpcproxy`, …), so the hook fires for every exec.
 
 
+### Ring from `shim-fleur-touchkeys6.img` (0084 + 0085 + 0086) and the touch root cause
+
+Evidence: `/tmp/opencode/ring-tk6.bin` → `ring-tk6.txt` (4666 lines).
+
+**Observed in the ring:**
+- `cg infra1 0x00000800->0x00000800 imp 0x00000000->0x00000000 i2c_sel 3->0`
+  — clocks ungated (bit clear = clock on) and `i2c_sel` forced to clk26m
+- `timing=0x0007 ltiming=0x0008 ctl=0x0028 div=0x0404 io=0x0003` — controller
+  programmed, open-drain
+- `chip ID 0xb1` — the panel answers on I2C
+- **0** `I2C fail` lines in the entire ring → every poll succeeded
+- exactly **two** touch lines: `finger 0 down at 433,433` + `finger 0 up`,
+  both *before* SpringBoard exec (line 512 = the mute) — one phantom event at
+  driver start, then nothing for the rest of the boot
+- `SWEET console: muted on SpringBoard exec` — **0086 works**
+- keypad: `sel=0x1c70 scan=0x0000 en=0x0001 deb=0x0400` byte-identical before
+  and after the run (0085 writes only `KP_DEBOUNCE`), and 27 presses → 27 ×
+  `key 2 down` (slot 2 = `kHIDUsage_Csmr_VolumeDecrement`, correct)
+- the phantom column dump `hw 0,9,18,27,36,45,54,63` is cosmetic: fleur's
+  `kpd-hw-init-map` is all zeros except `[0] = 0x72` (KEY_VOLUMEDOWN), the
+  vendor's own loop zeroes the rest, and `fk_slot()` only maps 0/8/17
+
+**Cause:** the poll loop calls `ft_read_points()` at least every 5th poll
+(50 ms) regardless of the IRQ line, and no read ever failed — so the driver was
+reading the panel continuously and being told "0 points" every time. The count
+byte was simply in the wrong place.
+
+Vendor index vs our index (`fts_read_touchdata()` in
+`ft3418_i2c/focaltech_core.c`: `buf[0] = 0x01`, then 62 data bytes, so vendor
+index *k* = data byte *k − 1*):
+
+| field | vendor `buf[]` | our index (= data byte) | we read |
+|---|---|---|---|
+| point count (`FTS_TOUCH_POINT_NUM` = 2) | 2 | **1** | index 0 ✗ |
+| point i `event<<6 \| x_h` (`FTS_TOUCH_EVENT_POS` = 3) | 3 + 6i | **2 + 6i** | ✓ (accident) |
+| `x_l` | 4 + 6i | 3 + 6i | ✓ |
+| `id<<4 \| y_h` (`FTS_TOUCH_ID_POS` = 5) | 5 + 6i | 4 + 6i | ✓ |
+| `y_l` | 6 + 6i | 5 + 6i | ✓ |
+
+Our x/y bytes land on the vendor's x/y bytes by accident (same 6-byte stride,
+x read at record-relative +1/+2), so **only the count byte was wrong**:
+`data[0]` is held at 0 after boot, `data[1]` is the count. That is exactly the
+symptom — one phantom event at start when `data[0]` was briefly non-zero, then
+zero touches forever with no I2C errors.
+
+**Fix — commit `ce4747b` (0084 regenerated by `gen-patches.py` from the
+buildtree baseline), CI run `40394561768`:**
+- `np = buf[1] & 0x0F`, record at `base = 2 + 6*i`
+- `event = buf[base] >> 6` (0 down / 1 up / 2 contact), `id = buf[base+2] >> 4`,
+  drop the point when `id >= FTS_MAX_ID (0x0A)`
+- read `2 + 10*6 = 62` bytes (was 61: the last point's area byte was outside
+  the buffer)
+- reset 1 ms low / **200 ms** high (`fts_reset_proc(200)`); our old 5/50 ms
+  sampled the chip before its FW came up
+- chip id: read `0xA3` **and** `0x9F`, retry 10 × 100 ms, compare against
+  `0x5452` (`FTS_CHIP_TYPE_MAPPING` for `FTS_CHIP_TYPE = _FT3418`); on mismatch
+  send `eb aa 09`, exactly what `fts_get_ic_information()` → `fts_hid2std()`
+  does
+- raw dump of the first frames so the next ring shows the layout directly
+
+**Open question:** `0xb1` (read 0xA3 after only 50 ms) does not match the
+vendor's `0x5452`. Either the reset window was too short (now fixed) or the
+panel is in HID mode and needs `eb aa 09` (now also sent). The next ring's
+`chip ID 0x..0x.. (expect 0x5452)` line settles it.
+
+**Still unproven:** `sweethidtest=8` exercises the **key** path only —
+`SweetHIDTouch` (0058) has never been driven end-to-end. If touch still does
+nothing with a correct frame, the next suspect is service publication /
+normalisation in 0058, not the panel.
+
+**Power and volume-up will never appear in the matrix**: they are MT6358 PMIC
+keys (`kpd-sw-pwrkey = 0x74` KEY_POWER, `kpd-sw-rstkey = 0x73` KEY_VOLUMEUP,
+`kpd-pwrkey-eint-gpio = 0`), so they need the read-only PWRAP read at
+`0x1000d000` (`pwrap_read16()`, `mtk-pmic-wrap.c:3051`).
+
+
 ### 🛠 Tools written (committed in `tools/`)
 - `payload-bootargs.py` — edit boot-args in a packed payload
 - `replace-adt.py` — splice ADT in place, validates dram-base/size
@@ -205,7 +288,9 @@ still in the persistent ring, and `panic_active()` still draws a panic.
 | `shim-fleur-hidtest-8c.img` | hidtest + `cpus=8` | 8 cores + synthetic Home |
 | `shim-fleur-touchkeys3.img` | ci2 line + **`ufslun=2`** | booted past the root, panicked in `ft_thread` |
 | `shim-fleur-touchkeys4.img` | touchkeys3 + GPIO offset fix | booted to the home screen; touch dead, keys silent (wrong maps) |
-| `shim-fleur-touchkeys5.img` | touchkeys4 + 0084/0085 from the kernel source | candidate: register readbacks + raw hw-key log |
+| `shim-fleur-touchkeys5.img` | touchkeys4 + 0084/0085 from the kernel source | register readbacks + raw hw-key log |
+| `shim-fleur-touchkeys6.img` | touchkeys5 + 0086 (console mute) + KP_SEL/KP_EN fix | ring pulled 2026-10-26 19:xx — mute ✓, keys 27/27 ✓, touch count byte ✗ |
+| `shim-fleur-touchkeys7.img` | touchkeys6 + 0084 point-count/frame fix (`ce4747b`) | **candidate**: touch frame + chip-id retry + hid2std |
 
 ## Next device cycle (automated)
 1. **Flash**: Vol-Down + Power → fastboot → `/tmp/opencode/flash-watch.sh`
@@ -355,24 +440,35 @@ hand-copied register dump.
    (console mutes at SpringBoard exec) — `544cfd1`, CI **40378590062** green;
    regenerated 0085 without the `KP_SEL`/`KP_EN` writes — `38f5340`,
    CI **40381465166** dispatched
-9. 🔜 Build `shim-fleur-touchkeys6.img` from **40381465166**:
-   `bash /tmp/opencode/build-new-image.sh 40381465166 touchkeys6`, then grep
-   the payload for `SWEET FLEUR`, `i2c_sel`, `muted on SpringBoard`
-10. 🔜 Flash `boot_b` via `/tmp/opencode/flash-watch.sh` (user does
-    Vol-Down+Power), pull the ring, and look for
-    `before sta=… sel=… scan=… en=…` / `after …` (must show what LK left and
-    that only the debounce changed), `cg infra1 … -> …` (bit 29 must be
-    **cleared**), `timing=… ltiming=… ctl=… div=… io=…` (must be **non-zero**),
-    the FTS chip ID, `finger N down at x,y`,
-    `SWEET FLEUR KEYS: down[N]: 0(r0/c0)` — a single key per press — and
-    `SWEET console: muted on SpringBoard exec`
-11. Restore the 3 lost root hand-fixes (`disabled.plist` bluetoothd/fairplayd
+9. ✅ Built `shim-fleur-touchkeys6.img` from **40381465166**, flashed `boot_b`,
+   pulled the ring → `/tmp/opencode/ring-tk6.txt`. Result: console mute ✓,
+   keypad registers untouched ✓, 27/27 volume-down ✓, **touch still dead** —
+   the panel reported 0 points on every one of hundreds of successful reads
+   (see "Ring from `shim-fleur-touchkeys6.img`")
+10. ✅ Found the cause in `ft3418_i2c/focaltech_core.c`: the point count is
+    **data byte 1**, not 0 (vendor `buf[0]` holds the register address). Fixed
+    0084 + adopted the vendor frame/reset/id sequence → **`ce4747b`**,
+    CI **40394561768** dispatched
+11. 🔜 Build `shim-fleur-touchkeys7.img` from **40394561768**:
+    `bash /tmp/opencode/build-new-image.sh 40394561768 touchkeys7`, grep the
+    payload for `SWEET FLEUR TOUCH`, flash `boot_b` with
+    `/tmp/opencode/flash-watch.sh`, pull the ring and look for
+    `frame cnt=N raw …` (the first dumps), `chip ID 0x..0x.. (expect 0x5452)`,
+    and `finger N id=… ev=… down at x,y` on every touch
+12. 🔜 If the frame is correct but nothing moves on screen, instrument the
+    **delivery** side (patch 0058 `SweetHIDTouch::touch()`): confirm the
+    service publishes and that normalised 0..1 coordinates reach backboardd
+13. 🔜 Bundle the read-only **PWRAP** PMIC-key driver (power + volume-up) and
+    the HakiOS two-look filter into the next cycle
+14. Restore the 3 lost root hand-fixes (`disabled.plist` bluetoothd/fairplayd
     → True, `ManagedConfiguration.framework` symlink, bluetoothd/fairplayd.H2
     plists) — needs user `sudo`, kills the 83× respawn loop
-12. Investigate CPU wallpaper renderer (QuartzCore `CA::OGL::SW`)
+15. Investigate CPU wallpaper renderer (QuartzCore `CA::OGL::SW`)
 
 ## Relevant files
-- `/tmp/opencode/ring-tk5.bin` / `ring-tk5.txt` — last ring (`touchkeys5` boot,
+- `/tmp/opencode/ring-tk6.bin` / `ring-tk6.txt` — last ring (`touchkeys6` boot,
+  4666 lines) — the evidence for the point-count-byte fix (`ce4747b`)
+- `/tmp/opencode/ring-tk5.bin` / `ring-tk5.txt` — earlier ring (`touchkeys5` boot,
   3974 lines, flush #26, 546 `SWEET FLEUR` lines) — the evidence for 0084/0085
 - `/tmp/opencode/ring-ui.bin` / `ring-ui.txt` — earlier ring (UI boot, 3592 lines, flush #178)
 - `/tmp/opencode/console14.txt` — earlier ring decode (172246 B)
