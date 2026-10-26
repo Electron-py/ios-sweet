@@ -23,7 +23,7 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 - iOS root = HFS+ in `userdata` partition (LUN 2)
 - Ring buffer at `0x1dc9bf7000` (4 MiB, header `SWEETLOG`)
 
-## Current state (2026-10-26, updated 17:00)
+## Current state (2026-10-26, updated 19:30)
 
 ### ✅ Working
 - Full 8-core boot (`cpus=8`)
@@ -38,13 +38,20 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 - **Patch 0084 + 0085 rewritten from the MT6781 kernel source** (commits `10a6eca`
   + `cae9e25`; CI runs **40362364957** and **40364755941** green, both patches
   applied with no `Skipping patch`, both `.o` files compile with zero errors)
+- **Clock-gate polarity fix (0084) + new patch 0086** (console mutes when
+  SpringBoard execs) — commit `544cfd1`, CI run **40378590062** green
+  (7m26s, zero warnings/errors in `sweet_fleur_touch.c`, `sweet_fleur_keys.c`,
+  `kern_exec.c`; the only "skipped patch" lines are the pre-existing
+  `dxb/patches/*` set)
+- **Patch 0085 KP_SEL/KP_EN fix** — commit `38f5340`, CI run **40381465166**
+  dispatched (build pending)
 - **CI build green** (run 40203488333, macos-14, Xcode 15.4)
 
 ### ⚠️ Missing (blockers for "usable")
 | Feature | Hardware | What's needed |
 |---------|----------|---------------|
-| **Touch** | FocalTech FTS, I2C, IRQ=15, RST=16, AVDD=58 | register map rewritten (0084) — **boot test pending** |
-| **Buttons** | MT6781 keypad matrix (GPIO80), PMIC power | register map rewritten (0085) — **boot test pending** |
+| **Touch** | FocalTech FTS, I2C, IRQ=15, RST=16, AVDD=58 | clock-gate polarity fixed (0084) — **boot test pending** |
+| **Buttons** | MT6781 keypad matrix (GPIO80), PMIC power | KP_SEL/KP_EN no longer written (0085) — **boot test pending** |
 | **Background/wallpaper** | CPU renderer path (no GPU) | QuartzCore CPU renderer + wallpaper service |
 | **bluetoothd/fairplayd respawn** (83×) | root image | 3 hand-fixes lost in the v3 25 GiB rebuild — see below |
 
@@ -103,6 +110,82 @@ below was **verified** against
 - The vendor `gpio_init_default` table (210 7-tuples: pin15 in, pin16
   out/low, pin58 out/low, pin80 mode1, pin144/145 mode1) is **not applied by
   any kernel file we ship**, so we set those mode/dir/dout values ourselves.
+
+### Ring from `shim-fleur-touchkeys5.img` (boot with 0084+0085, no 0086 yet)
+
+This is the evidence every fix below is built on — all **observed**, not
+guessed (ring pulled with `mtkclient ro 0x1dc9bf7000 0x401000`, decoded with
+`tools/sweet-log.py`):
+
+- **Keys init was already correct**: `mode80=0x1 pupd=0x6 r0=0xe r1=0x1`,
+  `kp_sta=0x0000 mem=0xffff 0xffff 0xffff 0xffff 0x00ff deb=0x0400 en=0x0001`,
+  `i2c_sel 3->0`. The keymap state matches the vendor reset value exactly.
+- **Touch produced nothing because every I2C register read 0**: `timing=0x0000
+  ltiming=0x0000 ctl=0x0000 div=0x0000 io=0x0000 intr=0x0000 dbg=0x0000`,
+  `stat=0x0000`, `no answer from FTS yet`, 0 finger events.
+- **Every button press lit a whole column**: 30 presses, each producing
+  `hw 0, 9, 18, 27, 36, 45, 54, 63` (`mem1=0xfdfe mem2=0xf7fb mem3=0xdfef
+  mem4=0x7fbf`) and nothing else — and **column 8 never read once**.
+
+### Why the I2C registers were all zero (fixed in 0084)
+
+`drivers/clk/mediatek/clk-gate.c` defines **bit cleared = clock ON**:
+`mtk_cg_is_enabled()` returns `mtk_cg_bit_is_cleared()`, the enable path
+writes `clr_ofs`, the disable path writes `set_ofs`. We were writing to
+`INFRA1_CG_SET` (0x10001088) and `imp_iic_wrap CG_SET` (0x11017E08), i.e.
+switching `infra_imp_iic` (INFRA1 bit 29) and `imp_ap_i2c0` (bit 0) **off**.
+0084 now writes `INFRA1_CG_CLR 0x8C` / `IMP_CG_CLR 0xE04` and prints the
+status registers before and after (`INFRA1_CG_STA 0x94`, `IMP_CG_STA 0xE00`)
+so the next ring shows bit 29 / bit 0 cleared.
+
+### Why only one volume button could ever work (fixed in 0085)
+
+The 8 lit positions are `hw = row*9 + col` with **col = 0 and row 0..7** —
+the layout is 8 rows × 9 columns, confirmed by Android's own
+`for (i = 17; i < KPD_NUM_KEYS; i += 9) kpd_keymap[i] = 0;` which zeroes
+column 8 of every row on top of `kpd_keymap[8] = 0` (the PMIC power key).
+The three buttons are:
+
+| button | hw | row/col | how Android maps it |
+|--------|----|---------|---------------------|
+| volume down | 0 | r0/c0 | `kpd-hw-init-map[0] = 0x72` → `KEY_VOLUMEDOWN` |
+| power | 8 | r0/c8 | `kpd-hw-pwrkey`, but `CONFIG_KPD_PWRKEY_USE_PMIC` zeroes it |
+| volume up | 17 | r1/c8 | `kpd-hw-rstkey = 0x11` + `kpd-sw-rstkey = 0x73` = `KEY_VOLUMEUP` (also `kpd-hw-dl-key0`) |
+
+So vol-up is **hw 17**, in column 8 — and column 8 was never read in 30
+presses, while a vol-down press lit all 8 rows of column 0. A scan that
+resolves neither rows nor the other columns makes both buttons look like
+hw 0 → both go down. Root cause of the degenerate scan: **we wrote
+`KP_SEL = 0` and `KP_EN = 1`, which Android never does.** Audited every
+hardware write in `mt6781/hal_kpd.c` + `kpd.c`:
+
+- `probe()` → `kpd_set_debounce(0x400)` → `request_irq()` — that is all
+- `kpd_open()` → `return 0` (no-op)
+- `enable_kpd()` → only from `kpd_wakeup_src_setting()` in suspend/resume
+  (`call_status` is a sysfs-only variable, never set at boot)
+- `kpd_double_key_enable()` → only if double-key DT props exist; fleur has none
+- `KP_SCAN_TIMING` / `KP_COL0..2_SEL` → **never written anywhere** (dead defines)
+
+`KP_EN = 1` is the prime suspect for "only column 0 readable" (it looks like
+a column-enable mask). 0085 now dumps `sta/sel/scan/en/deb/mem` before *and*
+after, writes only `KP_DEBOUNCE`, touches `KP_EN` only if it reads 0, logs
+`r%u/c%u` per hw code plus a one-line `down[N]:` summary whenever the held set
+changes, and polls at 5 ms instead of 20 ms.
+
+### Console mute at SpringBoard start (new patch 0086)
+
+`xnu/patches/0086-sweet-console-sb.patch` sets `sweet_console_muted = 1`
+inside `set_proc_name()` in `bsd/kern/kern_exec.c` when `p->p_name` compares
+equal to `SpringBoard` (`strncmp(..., sizeof("SpringBoard"))` includes the NUL,
+so it is an exact match). Boot diagnostics therefore stay on screen until
+SpringBoard execs, then the GUI owns the screen. **Nothing is lost**: patch
+0067 calls `sweet_log_append()` *before* the mute test, so the whole boot is
+still in the persistent ring, and `panic_active()` still draws a panic.
+
+`set_proc_name()` is the single writer of `p->p_name` (only the `bcopy` at
+`bsd/kern/kern_exec.c:913`), and the ring proves it stores the basename
+(`exec SpringBoard`, `exec xpcproxy`, …), so the hook fires for every exec.
+
 
 ### 🛠 Tools written (committed in `tools/`)
 - `payload-bootargs.py` — edit boot-args in a packed payload
@@ -221,7 +304,7 @@ hand-copied register dump.
   The result is only on the device after a **destructive `userdata` flash** —
   confirm with the user first.
 
-## Patch workflow (0084/0085 and anything new)
+## Patch workflow (0084/0085/0086 and anything new)
 
 - Hand-written diff hunks are unreliable — CI silently *skips* a malformed
   patch and the run still goes green. Only a compile error fails a run.
@@ -230,11 +313,18 @@ hand-copied register dump.
   (leftover edits in `base/xnu` from a previous run get baked into the diff).
 - Always regenerate: `/tmp/opencode/gen-patches.py` applies the driver
   sources + hooks to `/tmp/opencode/base/xnu`, writes the diff with
-  `git diff`, then verifies with `git apply --check` (`VERIFY: both patches
-  apply cleanly`).
-- Check every run for the word `Skipping patch … 0084/0085` before believing
+  `git diff`, then verifies with `git apply --check` (`VERIFY: all three
+  patches apply cleanly`). It rebuilds **0084, 0085 and 0086** and nothing
+  else; edit `/tmp/opencode/src/sweet_fleur_*.c` for 0084/0085, edit the
+  generator's `# ---- 0086 ----` block for 0086.
+- The baseline is the tree *after* patch 0083, so 0084/0085/0086 apply on
+  top of the rest of the stack in CI order; the generator's verify step
+  replays them in that order from a pristine `git archive HEAD~3`.
+- Check every run for the word `Skipping patch … 008[456]` before believing
   a kernel contains a driver; also grep the payload for a driver string
-  (`SWEET FLEUR TOUCH: starting`) before flashing.
+  (`SWEET FLEUR TOUCH: starting`) before flashing. The four `Skipping patch`
+  lines that are always present are the upstream `dxb/patches/*` set — not
+  ours — and so are the ~11 `error:` lines they emit.
 - `gh run watch <id> -R Electron-py/ios-sweet --exit-status` hangs with no
   output — poll with `gh run view <id>` instead, and read the log with
   `gh run view --job=<job-id> --log`.
@@ -257,31 +347,44 @@ hand-copied register dump.
    (+ `cae9e25`) → CI **40362364957** green (no `Skipping patch`, no errors,
    two benign `-Wunused-function` warnings) → fixed those in `cae9e25` →
    CI **40364755941**
-7. 🔜 Build `shim-fleur-touchkeys5.img` from 40364755941:
-   `bash /tmp/opencode/build-new-image.sh 40364755941 touchkeys5`, then
-   `grep` the payload for `i2c_sel`/`KP_MEM`/`SWEET FLEUR` to prove the
-   drivers are inside
-8. 🔜 Flash `boot_b` via `/tmp/opencode/flash-watch.sh` (user does
-   Vol-Down+Power), pull the ring, and look for
-   `mode pre/post 15/16/58/144`, `cg infra1/… i2c_sel 0->0`,
-   `timing=… ltiming=… ctl=… div=… io=…`, the FTS chip ID,
-   `I2C fail #n stat=…`, and `SWEET FLEUR KEYS: hw … down (mem…)`
-9. Restore the 3 lost root hand-fixes (`disabled.plist` bluetoothd/fairplayd
-   → True, `ManagedConfiguration.framework` symlink, bluetoothd/fairplayd.H2
-   plists) — needs user `sudo`, kills the 83× respawn loop
-10. Investigate CPU wallpaper renderer (QuartzCore `CA::OGL::SW`)
+7. ✅ Built `shim-fleur-touchkeys5.img` from 40364755941, flashed `boot_b`,
+   booted: keys init OK but **all I2C registers read 0** (we wrote `*_CG_SET`,
+   i.e. gated the clocks) and **every press lit a whole column** (see "Ring
+   from `shim-fleur-touchkeys5.img`")
+8. ✅ Regenerated 0084 with the clock-gate polarity fix, added **0086**
+   (console mutes at SpringBoard exec) — `544cfd1`, CI **40378590062** green;
+   regenerated 0085 without the `KP_SEL`/`KP_EN` writes — `38f5340`,
+   CI **40381465166** dispatched
+9. 🔜 Build `shim-fleur-touchkeys6.img` from **40381465166**:
+   `bash /tmp/opencode/build-new-image.sh 40381465166 touchkeys6`, then grep
+   the payload for `SWEET FLEUR`, `i2c_sel`, `muted on SpringBoard`
+10. 🔜 Flash `boot_b` via `/tmp/opencode/flash-watch.sh` (user does
+    Vol-Down+Power), pull the ring, and look for
+    `before sta=… sel=… scan=… en=…` / `after …` (must show what LK left and
+    that only the debounce changed), `cg infra1 … -> …` (bit 29 must be
+    **cleared**), `timing=… ltiming=… ctl=… div=… io=…` (must be **non-zero**),
+    the FTS chip ID, `finger N down at x,y`,
+    `SWEET FLEUR KEYS: down[N]: 0(r0/c0)` — a single key per press — and
+    `SWEET console: muted on SpringBoard exec`
+11. Restore the 3 lost root hand-fixes (`disabled.plist` bluetoothd/fairplayd
+    → True, `ManagedConfiguration.framework` symlink, bluetoothd/fairplayd.H2
+    plists) — needs user `sudo`, kills the 83× respawn loop
+12. Investigate CPU wallpaper renderer (QuartzCore `CA::OGL::SW`)
 
 ## Relevant files
-- `/tmp/opencode/ring-ui.bin` / `ring-ui.txt` — last ring (UI boot, 3592 lines, flush #178)
+- `/tmp/opencode/ring-tk5.bin` / `ring-tk5.txt` — last ring (`touchkeys5` boot,
+  3974 lines, flush #26, 546 `SWEET FLEUR` lines) — the evidence for 0084/0085
+- `/tmp/opencode/ring-ui.bin` / `ring-ui.txt` — earlier ring (UI boot, 3592 lines, flush #178)
 - `/tmp/opencode/console14.txt` — earlier ring decode (172246 B)
-- `/tmp/opencode/gen-patches.py` — regenerate 0084/0085 from the CI baseline
+- `/tmp/opencode/gen-patches.py` — regenerate 0084/0085/**0086** from the CI baseline
 - `/tmp/opencode/src/sweet_fleur_touch.c` / `sweet_fleur_keys.c` — driver sources
 - `/tmp/opencode/build-new-image.sh <run-id> <name>` — payload → shim image
 - `/tmp/opencode/flash-watch.sh` — armed fastboot watcher (flashes `boot_b` only)
 - `/tmp/opencode/console7.txt` — 8-core hidtest boot (248888 B, 27 samples, 24 swaps)
-- `/home/tom/Documents/musi/fleur.dts` — Android DT (touch@0 = focaltech,fts)
+- `/home/tom/Documents/musi/fleur.dts` — Android DT (touch@0 = focaltech,fts; kpd node ~line 3168)
 - `/home/tom/src-check/Xiaomi_Kernel_OpenSource-32022887f842ec64e317fc22745fedf35e982837/` — authoritative register maps
 - `/home/tom/Documents/musi/ios-sweet/xnu/patches/0083-sweet-synthetic-input.patch` — ready
+- `/home/tom/Documents/musi/ios-sweet/xnu/patches/0086-sweet-console-sb.patch` — console mute at SpringBoard exec
 - `/home/tom/Documents/musi/ios-sweet/tools/` — all tooling
 - `/home/tom/Downloads/ipsw/…` — IPSW source (git-ignored)
 
@@ -292,4 +395,4 @@ hand-copied register dump.
 
 ---
 
-*Updated 2026-10-26 17:00: UI milestone reached (user sees the SpringBoard home screen, ring flush #178 ≈ 30 min, no panic); touch + keys still dead because both drivers used hand-guessed register maps — both rewritten from the Xiaomi MT6781 kernel source (commits `10a6eca`, `cae9e25`, CI 40362364957 / 40364755941 green). Next: build `touchkeys5` from run 40364755941, flash `boot_b`, read the register readbacks from the ring.*
+*Updated 2026-10-26 19:30: two root causes found from the `touchkeys5` ring. (1) Touch: we wrote `*_CG_SET` where `clk-gate.c` treats **bit cleared = clock ON**, so `infra_imp_iic` / `imp_ap_i2c0` were switched *off* and every I2C register read 0 — fixed in 0084 (CI 40378590062 green). (2) Keys: every press lit all 8 rows of column 0 and column 8 (hw 8 power, hw 17 volume-up) never read once, because we wrote `KP_SEL = 0` and `KP_EN = 1`, neither of which Android ever writes at boot — fixed in 0085 (commit `38f5340`, CI 40381465166 in flight). Also added **0086**, which mutes the on-screen console when SpringBoard execs so the next test shows the UI without kernel text while the ring keeps everything. Next: build `touchkeys6` from 40381465166, flash `boot_b`, read the `before/after` register dumps.*
