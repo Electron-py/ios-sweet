@@ -23,7 +23,7 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 - iOS root = HFS+ in `userdata` partition (LUN 2)
 - Ring buffer at `0x1dc9bf7000` (4 MiB, header `SWEETLOG`)
 
-## Current state (2026-10-26, updated 20:30)
+## Current state (2026-10-26, updated 21:45)
 
 ### ✅ Working
 - Full 8-core boot (`cpus=8`)
@@ -50,19 +50,25 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
   **does** mute the console (`SWEET console: muted on SpringBoard exec`), and
   the keypad now leaves `KP_SEL/KP_EN` untouched (`before` == `after`) with
   27 presses → 27 × `key 2 down` (slot 2 = VolumeDecrement, correct)
-- **Touch point-count byte fixed** (0084) — commit `ce4747b`, CI **40394561768
-  green**, `shim-fleur-touchkeys7.img` built from it (all new format strings
-  present in the payload, no `Skipping patch` for 0084–0086), flash watcher
-  armed on `boot_b`
+- **Touch confirmed working on screen by the user** (`shim-fleur-touchkeys7.img`
+  from CI **40394561768**, flashed to `boot_b` by the watcher) — the
+  point-count byte fix in `ce4747b` was the whole bug
+- **Next build disables the synthetic Home press**: `sweethidtest=8` removed
+  from `BASE` in `build-new-image.sh` (kernel unchanged, boot-args only) →
+  `shim-fleur-nohome.img`, `sweettouch=1 sweetkeys=1` kept so volume/power can
+  be tested live while the button path is fixed
 - **CI build green** (run 40203488333, macos-14, Xcode 15.4)
 
 ### ⚠️ Missing (blockers for "usable")
 | Feature | Hardware | What's needed |
 |---------|----------|---------------|
-| **Touch** | FocalTech FTS, I2C, IRQ=15, RST=16, AVDD=58 | point-count byte moved to the vendor's (`buf[1]`, commit `ce4747b`) — **boot test pending**; the delivery path (0058 `SweetHIDTouch`) has still never been proven end-to-end |
-| **Buttons** | MT6781 keypad matrix (GPIO80), PMIC power | volume-down **delivered** (tk6: 27 → 27, correct slot). `fk_slot()` already maps every matrix key the DT defines — hw 0 = VOLDN (`kpd-hw-init-map[0]=0x72`), hw 8 = POWER (`kpd-hw-pwrkey=0x08`), hw 17 = VOLUP (`kpd-hw-rstkey=0x11` + `kpd-sw-rstkey=0x73`) — so **volume-up only needs a press test**; power may be the MT6358 instead (`MT6358_PWRKEY_PRESS_STS` 0xa40 via pwrap) if hw 8 never appears. HakiOS two-look filter still to add |
+| **Buttons** | MT6781 keypad matrix (GPIO80), PMIC power | volume-down **delivered** (tk6: 27 → 27, correct slot). `fk_slot()` already maps every matrix key the DT defines — hw 0 = VOLDN (`kpd-hw-init-map[0]=0x72`), hw 8 = POWER (`kpd-hw-pwrkey=0x08`), hw 17 = VOLUP (`kpd-hw-rstkey=0x11` + `kpd-sw-rstkey=0x73`) — so **volume-up only needs a press test**; power may be the MT6358 instead (`MT6358_PWRKEY_PRESS_STS` 0xa40 via pwrap) if hw 8 never appears. **Active — current fix target** (synthetic Home removed so buttons are judged honestly) |
 | **Background/wallpaper** | CPU renderer path (no GPU) | QuartzCore CPU renderer + wallpaper service |
 | **bluetoothd/fairplayd respawn** (83×) | root image | 3 hand-fixes lost in the v3 25 GiB rebuild — see below |
+
+✅ **Touch is fixed and confirmed by the user** (`shim-fleur-touchkeys7.img`,
+commit `ce4747b`) — FTS point count, `SweetHIDTouch` delivery and backboardd
+all verified end-to-end.
 
 ### Why touch/keys produced nothing (2026-10-26 analysis)
 
@@ -309,7 +315,8 @@ If hw 8 never shows up in a ring, that read-only PWRAP driver is the fix.
 | `shim-fleur-touchkeys4.img` | touchkeys3 + GPIO offset fix | booted to the home screen; touch dead, keys silent (wrong maps) |
 | `shim-fleur-touchkeys5.img` | touchkeys4 + 0084/0085 from the kernel source | register readbacks + raw hw-key log |
 | `shim-fleur-touchkeys6.img` | touchkeys5 + 0086 (console mute) + KP_SEL/KP_EN fix | ring pulled 2026-10-26 19:xx — mute ✓, keys 27/27 ✓, touch count byte ✗ |
-| `shim-fleur-touchkeys7.img` | touchkeys6 + 0084 point-count/frame fix (`ce4747b`) | **candidate**: touch frame + chip-id retry + hid2std |
+| `shim-fleur-touchkeys7.img` | touchkeys6 + 0084 point-count/frame fix (`ce4747b`) | **touch confirmed working by the user** |
+| `shim-fleur-nohome.img` | touchkeys7 + `sweethidtest=8` **removed** from `BASE` | active: buttons testable without a synthetic Home press every 8 s |
 
 ## Next device cycle (automated)
 1. **Flash**: Vol-Down + Power → fastboot → `/tmp/opencode/flash-watch.sh`
@@ -469,15 +476,19 @@ hand-copied register dump.
     0084 + adopted the vendor frame/reset/id sequence → **`ce4747b`**,
     CI **40394561768 green**, built `shim-fleur-touchkeys7.img`, armed
     `flash-watch.sh` for `boot_b`
-11. 🔜 Pull the ring after the touchkeys7 boot and look for
-    `frame cnt=N raw …` (the first dumps), `chip ID 0x..0x.. (expect 0x5452)`,
-    `finger N id=… ev=… down at x,y`, and the matching
-    `SWEET HID: touch N down at x,y` (proves delivery to backboardd)
-12. 🔜 If the frame is correct but nothing moves on screen, instrument the
-    **delivery** side (patch 0058 `SweetHIDTouch::touch()`): confirm the
-    service publishes and that normalised 0..1 coordinates reach backboardd
-13. 🔜 Bundle the read-only **PWRAP** PMIC-key driver (power + volume-up) and
-    the HakiOS two-look filter into the next cycle
+11. ✅ `shim-fleur-touchkeys7.img` flashed by the watcher and the **user
+    confirmed touch works on screen** — driver frame, `SweetHIDTouch`
+    delivery and backboardd all verified end-to-end. (The tk7 ring was not
+    pulled: it needs a power-off. Optional later — it would show
+    `frame cnt=N raw …`, `chip ID 0x..0x.. (expect 0x5452)` and
+    `finger N id=… ev=… down at x,y`.)
+12. ✅ `shim-fleur-nohome.img` built from **40394561768** with `sweethidtest=8`
+    removed from `BASE` (kernel unchanged, boot-args only); flash watcher
+    armed. Purpose: judge the buttons without a synthetic Home press every 8 s.
+13. 🔜 **Fix buttons** (current target): check volume-up (hw 17) and power
+    (hw 8) on screen with the nohome image, add the HakiOS **two-look** filter
+    to `sweet_fleur_keys.c`, and only if hw 8 never appears add the read-only
+    PWRAP read of `MT6358_PWRKEY_PRESS_STS` (0xa40) via `pwrap_read16()`
 14. Restore the 3 lost root hand-fixes (`disabled.plist` bluetoothd/fairplayd
     → True, `ManagedConfiguration.framework` symlink, bluetoothd/fairplayd.H2
     plists) — needs user `sudo`, kills the 83× respawn loop
