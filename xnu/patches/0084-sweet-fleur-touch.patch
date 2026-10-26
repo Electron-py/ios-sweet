@@ -12,10 +12,10 @@ index 6630131..0b14e68 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_fleur_touch.c b/bsd/dev/sweet_fleur_touch.c
 new file mode 100644
-index 0000000..dacf878
+index 0000000..d8d499a
 --- /dev/null
 +++ b/bsd/dev/sweet_fleur_touch.c
-@@ -0,0 +1,719 @@
+@@ -0,0 +1,835 @@
 +/*
 + * FLEUR MT6781: MTK I2C + FocalTech FTS touch driver.
 + * Reads touch reports over I2C and feeds them through sweet_hid_touch().
@@ -153,13 +153,38 @@ index 0000000..dacf878
 +#define IOCFG_PU                0x40u   /* pin144 = bit 2, pin145 = bit 4 */
 +#define IOCFG_PD                0x30u
 +
-+/* FocalTech FTS registers */
++/*
++ * FocalTech FTS registers, frame layout and boot sequence: all from
++ * drivers/input/touchscreen/mediatek/ft3418_i2c/ in the MT6781 Android
++ * kernel (the driver that matches DT compatible = "focaltech,fts").
++ *
++ *   FTS_TOUCH_DATA_LEN  = 10 * FTS_ONE_TCH_LEN + 3   (focaltech_core.h)
++ *   fts_read_touchdata(): buf[0] = 0x01, then 62 data bytes follow, so
++ *   with our buffer (no leading register byte) data byte n == buf[n].
++ *   Vendor index k therefore maps to buf[k - 1]:
++ *     FTS_TOUCH_POINT_NUM 2 -> count at buf[1]
++ *     FTS_TOUCH_EVENT_POS 3 -> point i at buf[2 + 6*i]
++ */
 +#define FTS_ADDR        0x38u
 +#define FTS_MAX_FINGERS 10u
 +#define FTS_POINTS_REG  0x01u
 +#define FTS_POINT_LEN   6u
-+#define FTS_ID_REG      0xA3u
++#define FTS_ID_REG      0xA3u   /* FTS_REG_CHIP_ID  (chip id high) */
++#define FTS_ID_REG2     0x9Fu   /* FTS_REG_CHIP_ID2 (chip id low)  */
 +#define FTS_CTRL_REG    0x86u
++#define FTS_MAX_ID      10u     /* id nibble >= this = no such point */
++
++/* event field, buf[base] >> 6 (focaltech_core.h) */
++#define FTS_TOUCH_DOWN      0u
++#define FTS_TOUCH_UP        1u
++#define FTS_TOUCH_CONTACT   2u
++
++/* FTS_CHIP_TYPE_MAPPING for _FT3418: the pair we expect to read back. */
++#define FTS_CHIP_IDH    0x54u
++#define FTS_CHIP_IDL    0x52u
++
++/* fts_hid2std(): written only when the id pair never matches. */
++#define FTS_HID2STD_REG 0xEBu
 +
 +#define TOUCH_IRQ_GPIO  15
 +#define TOUCH_RST_GPIO  16
@@ -184,6 +209,7 @@ index 0000000..dacf878
 +	uint16_t f_fifo;
 +	uint16_t f_ctl;
 +	unsigned fails;
++	unsigned rawdumps;      /* one-shot dumps of the vendor frame */
 +	int x[FTS_MAX_FINGERS];
 +	int y[FTS_MAX_FINGERS];
 +	bool down[FTS_MAX_FINGERS];
@@ -491,11 +517,18 @@ index 0000000..dacf878
 +	return 0;
 +}
 +
++/* Write-only transfer (fts_write(): first byte is the register address). */
++static int
++ft_i2c_write(const uint8_t *data, unsigned len)
++{
++	return ft_i2c_xfer(data, len, NULL, 0);
++}
++
 +static void
 +ft_read_points(void)
 +{
-+	uint8_t buf[1 + FTS_MAX_FINGERS * FTS_POINT_LEN];
-+	unsigned i, touch_cnt;
++	uint8_t buf[2 + FTS_MAX_FINGERS * FTS_POINT_LEN];
++	unsigned i, np;
 +
 +	if (ft_i2c_read(FTS_POINTS_REG, buf, sizeof(buf)) != 0) {
 +		if (!ft.warned) {
@@ -505,30 +538,51 @@ index 0000000..dacf878
 +		return;
 +	}
 +	ft.warned = false;
-+	touch_cnt = buf[0] & 0x0F;
-+	if (touch_cnt > FTS_MAX_FINGERS) {
-+		touch_cnt = FTS_MAX_FINGERS;
++
++	/*
++	 * Vendor frame (ft3418_i2c): buf[1] = point count, then for each
++	 * point i at base = 2 + 6*i:
++	 *   [base+0] event (7:6) | x high (3:0)
++	 *   [base+1] x low
++	 *   [base+2] id (7:4) | y high (3:0)
++	 *   [base+3] y low, [base+4] pressure, [base+5] area
++	 */
++	np = buf[1] & 0x0F;
++
++	if (ft.rawdumps < 3 || (np != 0 && ft.rawdumps < 8)) {
++		ft.rawdumps++;
++		printf("SWEET FLEUR TOUCH: frame cnt=%u raw "
++		    "%02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    np, buf[0], buf[1], buf[2], buf[3],
++		    buf[4], buf[5], buf[6], buf[7]);
 +	}
++	if (np > FTS_MAX_FINGERS) {
++		np = FTS_MAX_FINGERS;
++	}
++
 +	for (i = 0; i < FTS_MAX_FINGERS; ++i) {
 +		bool was = ft.down[i];
 +		bool now = false;
 +		int x = 0, y = 0;
++		unsigned id = FTS_MAX_ID, ev = FTS_TOUCH_UP;
 +
-+		if (i < touch_cnt) {
-+			uint8_t *p = &buf[1 + i * FTS_POINT_LEN];
-+			/* FTS frame: [event|id] x_hi x_lo y_hi y_lo ... */
-+			unsigned id = p[0] & 0x0F;
++		if (i < np) {
++			unsigned base = 2 + i * FTS_POINT_LEN;
 +
-+			if (id < FTS_MAX_FINGERS) {
-+				now = true;
-+				x = ((p[1] & 0x0F) << 8) | p[2];
-+				y = ((p[3] & 0x0F) << 8) | p[4];
++			id = buf[base + 2] >> 4;
++			ev = buf[base] >> 6;
++			if (id < FTS_MAX_ID) {
++				x = ((buf[base] & 0x0F) << 8) | buf[base + 1];
++				y = ((buf[base + 2] & 0x0F) << 8) |
++				    buf[base + 3];
 +				if (x > 1079) {
 +					x = 1079;
 +				}
 +				if (y > 2399) {
 +					y = 2399;
 +				}
++				/* 0 = down, 2 = contact, 1 = up */
++				now = (ev != FTS_TOUCH_UP);
 +			}
 +		}
 +		if (!was && now) {
@@ -536,11 +590,13 @@ index 0000000..dacf878
 +			ft.x[i] = x;
 +			ft.y[i] = y;
 +			sweet_hid_touch((int)i, 1, x, y);
-+			printf("SWEET FLEUR TOUCH: finger %u down at %d,%d\n", i, x, y);
++			printf("SWEET FLEUR TOUCH: finger %u id=%u ev=%u down "
++			    "at %d,%d\n", i, id, ev, x, y);
 +		} else if (was && !now) {
 +			ft.down[i] = false;
 +			sweet_hid_touch((int)i, 0, ft.x[i], ft.y[i]);
-+			printf("SWEET FLEUR TOUCH: finger %u up\n", i);
++			printf("SWEET FLEUR TOUCH: finger %u up (ev=%u)\n",
++			    i, ev);
 +		} else if (was && now && (x != ft.x[i] || y != ft.y[i])) {
 +			ft.x[i] = x;
 +			ft.y[i] = y;
@@ -599,11 +655,29 @@ index 0000000..dacf878
 +	    ft_rd(ft.iocfg, IOCFG_PU), ft_rd(ft.iocfg, IOCFG_PD));
 +}
 +
++/* FTS_REG_CHIP_ID (0xA3) = high byte, FTS_REG_CHIP_ID2 (0x9F) = low byte. */
++static int
++ft_read_ids(uint8_t *idh, uint8_t *idl)
++{
++	if (ft_i2c_read(FTS_ID_REG, idh, 1) != 0) {
++		return -1;
++	}
++	return ft_i2c_read(FTS_ID_REG2, idl, 1);
++}
++
++/* The pair FTS_CHIP_TYPE_MAPPING expects for FTS_CHIP_TYPE = _FT3418. */
++static bool
++ft_id_ok(uint8_t idh, uint8_t idl)
++{
++	return idh == FTS_CHIP_IDH && idl == FTS_CHIP_IDL;
++}
++
 +static void
 +ft_thread(void *arg, wait_result_t result)
 +{
-+	uint8_t id = 0;
++	uint8_t idh = 0, idl = 0;
 +	unsigned boot_try = 0;
++	unsigned itry;
 +
 +	(void)arg;
 +	(void)result;
@@ -660,13 +734,18 @@ index 0000000..dacf878
 +	    (ft_rd(ft.gpio, GPIO_MODE(58)) >> GPIO_MODE_SH(58)) & 0xF,
 +	    ft_rd(ft.gpio, GPIO_MODE(144)));
 +
-+	/* Power the panel touch rail, then pulse reset. */
++	/*
++	 * Vendor fts_reset_proc(200): reset low 1 ms, high, then wait
++	 * 200 ms for the panel FW to come up.  Our old 5/50 ms sequence
++	 * sampled the chip before it was valid, which is why the id read
++	 * came back as 0xb1 instead of 0x5452.
++	 */
 +	ft_gpio_write(TOUCH_AVDD_GPIO, TRUE);
 +	ft_wait(10);
 +	ft_gpio_write(TOUCH_RST_GPIO, FALSE);
-+	ft_wait(5);
++	ft_wait(1);
 +	ft_gpio_write(TOUCH_RST_GPIO, TRUE);
-+	ft_wait(50);
++	ft_wait(200);
 +
 +	ft_i2c_init_hw();
 +	printf("SWEET FLEUR TOUCH: timing=0x%04x ltiming=0x%04x "
@@ -676,11 +755,40 @@ index 0000000..dacf878
 +	    ft_rd16(ft.i2c, I2C_IO_CONFIG), ft_rd16(ft.i2c, I2C_INTR_STAT),
 +	    ft_rd16(ft.i2c, I2C_DEBUGSTAT));
 +
-+	if (ft_i2c_read(FTS_ID_REG, &id, 1) == 0) {
-+		printf("SWEET FLEUR TOUCH: chip ID 0x%02x\n", id);
-+	} else {
-+		printf("SWEET FLEUR TOUCH: no answer from FTS yet "
-+		    "(will keep polling)\n");
++	/*
++	 * Vendor fts_wait_tp_to_valid()/fts_get_ic_information(): read both
++	 * id bytes and retry before deciding the FW is invalid.
++	 */
++	for (itry = 0; itry < 10; ++itry) {
++		if (ft_read_ids(&idh, &idl) == 0 && idh != 0 && idl != 0) {
++			break;
++		}
++		ft_wait(100);
++	}
++	printf("SWEET FLEUR TOUCH: chip ID 0x%02x%02x (expect 0x%02x%02x)%s\n",
++	    idh, idl, FTS_CHIP_IDH, FTS_CHIP_IDL,
++	    ft_id_ok(idh, idl) ? "" : " -- no match");
++
++	if (!ft_id_ok(idh, idl)) {
++		/*
++		 * Exactly what fts_get_ic_information() does when the id
++		 * pair never validates: write fts_hid2std()'s 0xeb 0xaa 0x09
++		 * (HID -> standard I2C) and re-read.
++		 */
++		const uint8_t hid2std[3] = { 0xEB, 0xAA, 0x09 };
++
++		if (ft_i2c_write(hid2std, 3) == 0) {
++			printf("SWEET FLEUR TOUCH: wrote hid2std "
++			    "eb aa 09 (vendor fts_hid2std)\n");
++		} else {
++			printf("SWEET FLEUR TOUCH: hid2std write failed\n");
++		}
++		ft_wait(10);
++		if (ft_read_ids(&idh, &idl) == 0) {
++			printf("SWEET FLEUR TOUCH: chip ID after hid2std "
++			    "0x%02x%02x%s\n", idh, idl,
++			    ft_id_ok(idh, idl) ? " (matched)" : "");
++		}
 +	}
 +
 +	/*
@@ -689,10 +797,18 @@ index 0000000..dacf878
 +	 * ft_note_fail() on the first failure only.
 +	 */
 +	while (!ft.dead) {
-+		if (boot_try > 0 && (boot_try % 50) == 0) {
-+			if (id == 0 && ft_i2c_read(FTS_ID_REG, &id, 1) == 0) {
-+				printf("SWEET FLEUR TOUCH: chip ID 0x%02x "
-+				    "after %u tries\n", id, boot_try);
++		if (boot_try > 0 && (boot_try % 50) == 0 &&
++		    !ft_id_ok(idh, idl)) {
++			uint8_t idh2 = 0, idl2 = 0;
++
++			if (ft_read_ids(&idh2, &idl2) == 0) {
++				idh = idh2;
++				idl = idl2;
++				if (ft_id_ok(idh, idl)) {
++					printf("SWEET FLEUR TOUCH: chip ID "
++					    "0x%02x%02x after %u tries\n",
++					    idh, idl, boot_try);
++				}
 +			}
 +		}
 +		boot_try++;
