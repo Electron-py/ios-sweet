@@ -50,15 +50,17 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
   **does** mute the console (`SWEET console: muted on SpringBoard exec`), and
   the keypad now leaves `KP_SEL/KP_EN` untouched (`before` == `after`) with
   27 presses → 27 × `key 2 down` (slot 2 = VolumeDecrement, correct)
-- **Touch point-count byte fixed** (0084) — commit `ce4747b`, CI run
-  **40394561768** dispatched, build pending
+- **Touch point-count byte fixed** (0084) — commit `ce4747b`, CI **40394561768
+  green**, `shim-fleur-touchkeys7.img` built from it (all new format strings
+  present in the payload, no `Skipping patch` for 0084–0086), flash watcher
+  armed on `boot_b`
 - **CI build green** (run 40203488333, macos-14, Xcode 15.4)
 
 ### ⚠️ Missing (blockers for "usable")
 | Feature | Hardware | What's needed |
 |---------|----------|---------------|
 | **Touch** | FocalTech FTS, I2C, IRQ=15, RST=16, AVDD=58 | point-count byte moved to the vendor's (`buf[1]`, commit `ce4747b`) — **boot test pending**; the delivery path (0058 `SweetHIDTouch`) has still never been proven end-to-end |
-| **Buttons** | MT6781 keypad matrix (GPIO80), PMIC power | volume-down **delivered** (tk6: 27 presses → 27 events, correct slot); power + volume-up are MT6358 **PMIC** keys → need the read-only PWRAP driver; HakiOS two-look filter still to add |
+| **Buttons** | MT6781 keypad matrix (GPIO80), PMIC power | volume-down **delivered** (tk6: 27 → 27, correct slot). `fk_slot()` already maps every matrix key the DT defines — hw 0 = VOLDN (`kpd-hw-init-map[0]=0x72`), hw 8 = POWER (`kpd-hw-pwrkey=0x08`), hw 17 = VOLUP (`kpd-hw-rstkey=0x11` + `kpd-sw-rstkey=0x73`) — so **volume-up only needs a press test**; power may be the MT6358 instead (`MT6358_PWRKEY_PRESS_STS` 0xa40 via pwrap) if hw 8 never appears. HakiOS two-look filter still to add |
 | **Background/wallpaper** | CPU renderer path (no GPU) | QuartzCore CPU renderer + wallpaper service |
 | **bluetoothd/fairplayd respawn** (83×) | root image | 3 hand-fixes lost in the v3 25 GiB rebuild — see below |
 
@@ -212,6 +214,14 @@ Evidence: `/tmp/opencode/ring-tk6.bin` → `ring-tk6.txt` (4666 lines).
 - keypad: `sel=0x1c70 scan=0x0000 en=0x0001 deb=0x0400` byte-identical before
   and after the run (0085 writes only `KP_DEBOUNCE`), and 27 presses → 27 ×
   `key 2 down` (slot 2 = `kHIDUsage_Csmr_VolumeDecrement`, correct)
+- **HID side (patch 0058) is wired up and consumed**: `SWEET HID: touch
+  registered` and `SWEET HID: buttons registered`, `sweethidtest` Menu pairs go
+  out as `key 0x40 down (0 clients)` ×4 during boot and `(1 clients)` ×26 once
+  backboardd attaches, and the 27 volume presses are `key 0xea down (1
+  clients)` — so consumer usage 0xEA (VolumeDecrement) reaches a live client.
+  The one phantom touch also produced `SWEET HID: touch 0 down at 433,433`,
+  i.e. `sweet_hid_touch()` → `SweetHIDTouch::touch()` → `dispatchEvent()` works
+  end-to-end; only the point count ever reached 0.
 - the phantom column dump `hw 0,9,18,27,36,45,54,63` is cosmetic: fleur's
   `kpd-hw-init-map` is all zeros except `[0] = 0x72` (KEY_VOLUMEDOWN), the
   vendor's own loop zeroes the rest, and `fk_slot()` only maps 0/8/17
@@ -264,10 +274,19 @@ panel is in HID mode and needs `eb aa 09` (now also sent). The next ring's
 nothing with a correct frame, the next suspect is service publication /
 normalisation in 0058, not the panel.
 
-**Power and volume-up will never appear in the matrix**: they are MT6358 PMIC
-keys (`kpd-sw-pwrkey = 0x74` KEY_POWER, `kpd-sw-rstkey = 0x73` KEY_VOLUMEUP,
-`kpd-pwrkey-eint-gpio = 0`), so they need the read-only PWRAP read at
-`0x1000d000` (`pwrap_read16()`, `mtk-pmic-wrap.c:3051`).
+**Correction on power/volume-up (DT, `fleur.dts` kpd node):** the matrix *does*
+carry all three keys — `kpd-hw-init-map[0] = 0x72` (KEY_VOLUMEDOWN) → hw 0,
+`kpd-hw-pwrkey = 0x08` → hw 8, `kpd-hw-rstkey = 0x11` with
+`kpd-sw-rstkey = 0x73` (KEY_VOLUMEUP) → hw 17 — and `fk_slot()` already maps
+0/8/17 to VOLDN/POWER/VOLUP, so volume-up should work as soon as it is
+pressed. Only `kpd-pwrkey-eint-gpio = 0` (no GPIO for the power key) leaves open
+that **power** is sourced from the MT6358 instead: `mediatek,mt-pmic`
+interrupt-names include `pwrkey`/`pwrkey_r`, and `MT6358_PWRKEY_PRESS_STS =
+PMIC_BASE + 0xa40` is the press/release status register
+(`PMIC_PUP_PKEY_RELEASE_ADDR`), readable through `pwrap_read16()` at
+`0x1000d000` (`mtk-pmic-wrap.c:3051`). The generic handler
+(`mtk_pmic_keys.c:166`) does `regmap_read(deb_reg); pressed = !(val & mask)`.
+If hw 8 never shows up in a ring, that read-only PWRAP driver is the fix.
 
 
 ### 🛠 Tools written (committed in `tools/`)
@@ -448,13 +467,12 @@ hand-copied register dump.
 10. ✅ Found the cause in `ft3418_i2c/focaltech_core.c`: the point count is
     **data byte 1**, not 0 (vendor `buf[0]` holds the register address). Fixed
     0084 + adopted the vendor frame/reset/id sequence → **`ce4747b`**,
-    CI **40394561768** dispatched
-11. 🔜 Build `shim-fleur-touchkeys7.img` from **40394561768**:
-    `bash /tmp/opencode/build-new-image.sh 40394561768 touchkeys7`, grep the
-    payload for `SWEET FLEUR TOUCH`, flash `boot_b` with
-    `/tmp/opencode/flash-watch.sh`, pull the ring and look for
+    CI **40394561768 green**, built `shim-fleur-touchkeys7.img`, armed
+    `flash-watch.sh` for `boot_b`
+11. 🔜 Pull the ring after the touchkeys7 boot and look for
     `frame cnt=N raw …` (the first dumps), `chip ID 0x..0x.. (expect 0x5452)`,
-    and `finger N id=… ev=… down at x,y` on every touch
+    `finger N id=… ev=… down at x,y`, and the matching
+    `SWEET HID: touch N down at x,y` (proves delivery to backboardd)
 12. 🔜 If the frame is correct but nothing moves on screen, instrument the
     **delivery** side (patch 0058 `SweetHIDTouch::touch()`): confirm the
     service publishes and that normalised 0..1 coordinates reach backboardd
