@@ -23,7 +23,7 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 - iOS root = HFS+ in `userdata` partition (LUN 2)
 - Ring buffer at `0x1dc9bf7000` (4 MiB, header `SWEETLOG`)
 
-## Current state (2026-10-26, updated 14:00)
+## Current state (2026-10-26, updated 14:30)
 
 ### ✅ Working
 - Full 8-core boot (`cpus=8`)
@@ -34,15 +34,15 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 - SMP stack sampler (`sweetsample`), heap text dumper (`sweetscan`), crash reports
 - ADT with `/product` node (iPhone10,3 identity) — unblocked `LSApplicationRecord`
 - **Patch 0083 committed**: synthetic input boot-args (`sweeptouch`, `sweethidkey`)
-- **Patch 0084 + 0085 compiled into the kernel** (CI run **40324405863** green:
-  `CC sweet_fleur_touch.o`, `CC sweet_fleur_keys.o`, both in the link list)
+- **Patch 0084 + 0085 compiled into the kernel** (CI runs **40324405863** and
+  **40328758579** green: `CC sweet_fleur_touch.o`, `CC sweet_fleur_keys.o`)
 - **CI build green** (run 40203488333, macos-14, Xcode 15.4)
 
 ### ⚠️ Missing (blockers for "usable")
 | Feature | Hardware | What's needed |
 |---------|----------|---------------|
-| **Touch** | FocalTech FTS, I2C, IRQ=15, RST=16, AVDD=58 | **Patch 0084 committed** — needs kernel build + device test |
-| **Buttons** | PMIC/GPIO (Vol+/Vol-/Power) | **Patch 0085 committed** — needs kernel build + device test |
+| **Touch** | FocalTech FTS, I2C, IRQ=15, RST=16, AVDD=58 | **Patch 0084 in `touchkeys4`** — device test pending |
+| **Buttons** | PMIC/GPIO (Vol+/Vol-/Power) | **Patch 0085 in `touchkeys4`** — device test pending |
 | **Background/wallpaper** | CPU renderer path (no GPU) | QuartzCore CPU renderer + wallpaper service |
 
 ### 🛠 Tools written (committed in `tools/`)
@@ -61,7 +61,8 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 | `shim-fleur-verbose.img` | same + **no** `sweetfb_noconsole` | live console on screen |
 | `shim-fleur-hidtest.img` | verbose + `sweethidtest=8` | synthetic Home press every 8 s |
 | `shim-fleur-hidtest-8c.img` | hidtest + `cpus=8` | 8 cores + synthetic Home |
-| `shim-fleur-touchkeys3.img` | ci2 line + **`ufslun=2`** | first image with 0084+0085 in the kernel |
+| `shim-fleur-touchkeys3.img` | ci2 line + **`ufslun=2`** | booted past the root, panicked in `ft_thread` |
+| `shim-fleur-touchkeys4.img` | touchkeys3 + GPIO offset fix | candidate: touch/keys with mapping prints |
 
 ## Next device cycle (automated)
 1. **Flash**: Vol-Down + Power → fastboot → `/tmp/opencode/flash-watch.sh`
@@ -111,6 +112,55 @@ record. The panic's `printf`s above the backtrace are the ones to read.
 
 **Fix: `ufslun=2` is now part of the base boot line in the image build.**
 
+## The `ft_thread` data abort (fixed 2026-10-26)
+
+With `ufslun=2` the root mounted (52 threads, stackshot, userspace up) and the
+next panic was ours:
+
+```
+panic(cpu 2 …): Kernel data abort. at pc 0xfffffe00074eb62c, lr 0xfffffe00074eb680
+```
+
+`llvm-symbolizer --obj=kern/kernel.development.sweet` puts both in **`ft_thread`**
+(the artifact's kernel + dSYM symbolicate on Linux, no Xcode needed), and the
+disassembly says:
+
+```
+74eb624:  dmb   oshst
+74eb628:  lsl   x8, x0, #1        ; base * 2
+74eb62c:  str   wzr, [x8, #0x13c0]  ; <-- fault
+```
+
+The `GPIO_*` macros already contained the base (`GPIO_MODE(base,pin) = base +
+0x1000 + 0x40*pin`) while `ft_wr()`/`ft_rd()` add it again, so **every GPIO
+access went to `2 * base + off`**. `0x13c0 = 0x1000 + 0x40*15` is IRQ GPIO 15 —
+the first hardware write after mapping. Doubling a mapping from `io_submap`
+(`0xfffffe401e2a0000 - 0xfffffe401eaa0000`, printed at boot) lands in unmapped
+space → translation fault (ESR `0x96000045`, DFSC level 1).
+
+The keys driver was unaffected (its `KP_*` constants are plain offsets), which
+is why it ran first without dying. Fixed: GPIO macros now yield offsets only,
+and both drivers print their `ml_io_map()` results and refuse a non-canonical
+mapping instead of panicking.
+
+Beware of the on-screen panic text: it wraps at ~34 characters and the
+transcribed registers can lose digits (`x26` printed as `0xfffffe00000528a8`
+where the code says `0xfffffe00080528a8`). Trust the disassembly over a
+hand-copied register dump.
+
+## iOS root volume size
+
+- The HFS+ root is created by `tools/mkiosroot.sh` (`truncate -s SIZE`,
+  `mkfs.hfsplus -s -J`) and **now defaults to 25 GiB** (was 16 GiB;
+  `rebuild-fleur-root.sh` passes it explicitly).
+- userdata is 107.29 GiB, so 25 GiB still leaves ~82 GiB untouched and stays
+  far below the sweetlog ring (last 4 MiB of userdata).
+- Rebuild needs root (apfs-fuse, loop mounts, rsync):
+  `sudo tools/rebuild-fleur-root.sh /home/tom/Downloads/ipsw/<new-name>.img`
+  (it refuses to overwrite an existing output), then `img2simg` runs inside it.
+  The result is only on the device after a **destructive `userdata` flash** —
+  confirm with the user first.
+
 ## Patch workflow (0084/0085 and anything new)
 
 - Hand-written diff hunks are unreliable — CI silently *skips* a malformed
@@ -133,9 +183,13 @@ record. The panic's `printf`s above the backtrace are the ones to read.
 2. ✅ Dispatch CI build to verify toolchain green (run 40203488333 **success**)
 3. ✅ Write **patch 0084**: MTK I2C controller + FocalTech FTS touch driver (committed)
 4. ✅ Write **patch 0085**: MTK keypad + PMIC power key driver (committed)
-5. ✅ Build & test kernel with 0084+0085 on device — CI run 40324405863 green,
-   `shim-fleur-touchkeys3.img` built with `ufslun=2`; **flash + boot pending**
-6. Investigate CPU wallpaper renderer (QuartzCore `CA::OGL::SW`)
+5. ✅ Build & test kernel with 0084+0085 on device — `touchkeys3` (CI
+   40324405863) booted to the point of our own `ft_thread` data abort;
+   **CI 40328758579 green with the GPIO fix → `shim-fleur-touchkeys4.img`
+   built, flash armed, boot pending**
+6. Rebuild the iOS root at **25 GiB** (`sudo tools/rebuild-fleur-root.sh <new>.img`),
+   then flash `userdata` (destructive — ask first)
+7. Investigate CPU wallpaper renderer (QuartzCore `CA::OGL::SW`)
 
 ## Relevant files
 - `/tmp/opencode/console14.txt` — last ring decode (172246 B)
@@ -153,4 +207,4 @@ record. The panic's `printf`s above the backtrace are the ones to read.
 
 ---
 
-*Updated 2026-10-26 14:00: patches 0084/0085 compile into the kernel (CI 40324405863 green) and the `IOFindBSDRoot … unavailable: 6` panic is diagnosed (missing `ufslun=2`, patch 0082's boot arg).*
+*Updated 2026-10-26 14:30: panic #1 = missing `ufslun=2` (patch 0082's boot arg); panic #2 = GPIO macros double-adding the base in `ft_thread`; both fixed, CI 40328758579 green, `touchkeys4` ready to flash; root volume raised 16 → 25 GiB (rebuild pending).*

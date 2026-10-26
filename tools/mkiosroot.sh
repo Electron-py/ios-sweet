@@ -2,7 +2,9 @@
 # Build the SWEET iOS root: one case-sensitive HFS+ image holding an iOS OS
 # root filesystem plus its cryptexes, for the userdata partition (rd=ufsroot0).
 #
-#   mkiosroot.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img [SIZE]     (SIZE default 16G)
+#   mkiosroot.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img [SIZE]     (SIZE default 25G)
+# SIZE is the HFS+ volume size; it must stay well below the userdata partition
+# (107.3 GiB on fleur) and never reach the sweetlog ring at its last 4 MiB.
 #
 # The IPSW images are raw APFS with LZBITMAP-compressed files: they are read
 # through apfs-fuse (decompressing), so the HFS+ copy is uncompressed. On a
@@ -19,7 +21,7 @@
 set -euo pipefail
 
 [[ $# -ge 4 ]] || { sed -n '2,12p' "$0"; exit 2; }
-os=$(realpath "$1") sysos=$(realpath "$2") appos=$(realpath "$3") out=$4 size=${5:-16G}
+os=$(realpath "$1") sysos=$(realpath "$2") appos=$(realpath "$3") out=$4 size=${5:-25G}
 [[ ! -e $out ]] || { echo "refusing to overwrite $out" >&2; exit 1; }
 
 # apfs-fuse must know LZBITMAP (iOS 16 compresses most files with it).

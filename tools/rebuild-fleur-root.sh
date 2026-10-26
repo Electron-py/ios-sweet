@@ -35,7 +35,7 @@ else
 	[[ ! -e $img ]] || { echo "refusing to overwrite $img" >&2; exit 1; }
 	"$here/tools/mkiosroot.sh" \
 		"$dl/087-86698-044.dmg" "$dl/087-86593-047.dmg" "$dl/087-86715-047.dmg" \
-		"$img" 16G
+		"$img" 25G
 fi
 
 echo "== checking the built image"
