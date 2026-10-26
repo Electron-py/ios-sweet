@@ -12,10 +12,10 @@ index 0b14e68..56a66c8 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_fleur_keys.c b/bsd/dev/sweet_fleur_keys.c
 new file mode 100644
-index 0000000..9a3c43e
+index 0000000..6738522
 --- /dev/null
 +++ b/bsd/dev/sweet_fleur_keys.c
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,179 @@
 +/*
 + * FLEUR MT6781: MTK keypad controller driver (volume keys).
 + *
@@ -47,6 +47,8 @@ index 0000000..9a3c43e
 +#include <pexpert/pexpert.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
 +extern void sweet_hid_key(int key, int down);
 +void sweet_fleur_keys_init(void);
 +

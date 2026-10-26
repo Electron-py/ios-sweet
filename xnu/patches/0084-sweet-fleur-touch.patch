@@ -12,10 +12,10 @@ index 6630131..0b14e68 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_fleur_touch.c b/bsd/dev/sweet_fleur_touch.c
 new file mode 100644
-index 0000000..f3c82b7
+index 0000000..74c4740
 --- /dev/null
 +++ b/bsd/dev/sweet_fleur_touch.c
-@@ -0,0 +1,375 @@
+@@ -0,0 +1,359 @@
 +/*
 + * FLEUR MT6781: MTK I2C + FocalTech FTS touch driver.
 + * Reads touch reports over I2C and feeds them through sweet_hid_touch().
@@ -115,7 +115,7 @@ index 0000000..f3c82b7
 +static int ft_sleep_chan;
 +
 +static uint32_t
-+ft_rd(vm_offset_t base, uint32_t off)
++ft_rd(vm_offset_t base, vm_offset_t off)
 +{
 +	uint32_t v = *(volatile uint32_t *)(base + off);
 +	__asm__ volatile("dmb oshld" ::: "memory");
@@ -123,7 +123,7 @@ index 0000000..f3c82b7
 +}
 +
 +static void
-+ft_wr(vm_offset_t base, uint32_t off, uint32_t val)
++ft_wr(vm_offset_t base, vm_offset_t off, uint32_t val)
 +{
 +	__asm__ volatile("dmb oshst" ::: "memory");
 +	*(volatile uint32_t *)(base + off) = val;
@@ -197,22 +197,6 @@ index 0000000..f3c82b7
 +}
 +
 +static int
-+ft_i2c_write(uint8_t reg, const uint8_t *data, unsigned len)
-+{
-+	ft_wr(ft.i2c, I2C_SLAVE_ADDR, FTS_ADDR << 1);
-+	ft_wr(ft.i2c, I2C_DATA_PORT, reg);
-+	for (unsigned i = 0; i < len; ++i) {
-+		ft_wr(ft.i2c, I2C_DATA_PORT, data[i]);
-+	}
-+	ft_wr(ft.i2c, I2C_TRANSFER_LEN, 1 + len);
-+	ft_wr(ft.i2c, I2C_TRANSAC_LEN, 1);
-+	ft_wr(ft.i2c, I2C_CONTROL, I2C_CTRL_MASTER | I2C_CTRL_DIR_CHANGE |
-+	    I2C_CTRL_ACKERR_DET_EN);
-+	ft_wr(ft.i2c, I2C_START, 1);
-+	return ft_i2c_wait_done();
-+}
-+
-+static int
 +ft_i2c_read(uint8_t reg, uint8_t *data, unsigned len)
 +{
 +	/* Write the register address, then repeated-start into a read. */
@@ -244,7 +228,7 @@ index 0000000..f3c82b7
 +ft_read_points(void)
 +{
 +	uint8_t buf[1 + FTS_MAX_FINGERS * FTS_POINT_LEN];
-+	unsigned i;
++	unsigned i, touch_cnt;
 +
 +	if (ft_i2c_read(FTS_POINTS_REG, buf, sizeof(buf)) != 0) {
 +		if (!ft.warned) {
@@ -254,8 +238,7 @@ index 0000000..f3c82b7
 +		return;
 +	}
 +	ft.warned = false;
-+
-+	unsigned touch_cnt = buf[0] & 0x0F;
++	touch_cnt = buf[0] & 0x0F;
 +	if (touch_cnt > FTS_MAX_FINGERS) {
 +		touch_cnt = FTS_MAX_FINGERS;
 +	}
@@ -302,9 +285,10 @@ index 0000000..f3c82b7
 +static void
 +ft_thread(void *arg, wait_result_t result)
 +{
++	uint8_t id = 0;
++
 +	(void)arg;
 +	(void)result;
-+	uint8_t id = 0;
 +
 +	printf("SWEET FLEUR TOUCH: starting (MTK I2C @0x%08x, FTS @0x%02x)\n",
 +	    I2C_BASE, FTS_ADDR);
