@@ -12,10 +12,10 @@ index 6630131..0b14e68 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_fleur_touch.c b/bsd/dev/sweet_fleur_touch.c
 new file mode 100644
-index 0000000..dab8054
+index 0000000..381af7f
 --- /dev/null
 +++ b/bsd/dev/sweet_fleur_touch.c
-@@ -0,0 +1,716 @@
+@@ -0,0 +1,709 @@
 +/*
 + * FLEUR MT6781: MTK I2C + FocalTech FTS touch driver.
 + * Reads touch reports over I2C and feeds them through sweet_hid_touch().
@@ -484,16 +484,6 @@ index 0000000..dab8054
 +	return 0;
 +}
 +
-+static int
-+ft_i2c_write(uint8_t reg, uint8_t val)
-+{
-+	uint8_t buf[2];
-+
-+	buf[0] = reg;
-+	buf[1] = val;
-+	return ft_i2c_xfer(buf, 2, NULL, 0);
-+}
-+
 +static void
 +ft_read_points(void)
 +{
@@ -696,8 +686,11 @@ index 0000000..dab8054
 +			}
 +		}
 +		boot_try++;
-+		/* Always poll: the INT line may never assert if mismuxed. */
-+		ft_read_points();
++		/* Read when the (active-low) INT line asserts, plus every 5th
++		 * poll so a mismapped INT line still gives us data. */
++		if (!ft_gpio_read(TOUCH_IRQ_GPIO) || (boot_try % 5) == 0) {
++			ft_read_points();
++		}
 +		ft_wait(10);
 +	}
 +
