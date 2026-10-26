@@ -12,10 +12,10 @@ index 6630131..0b14e68 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_fleur_touch.c b/bsd/dev/sweet_fleur_touch.c
 new file mode 100644
-index 0000000..381af7f
+index 0000000..dacf878
 --- /dev/null
 +++ b/bsd/dev/sweet_fleur_touch.c
-@@ -0,0 +1,709 @@
+@@ -0,0 +1,719 @@
 +/*
 + * FLEUR MT6781: MTK I2C + FocalTech FTS touch driver.
 + * Reads touch reports over I2C and feeds them through sweet_hid_touch().
@@ -131,12 +131,19 @@ index 0000000..381af7f
 +#define GPIO_MODE_SH(pin)       (4u * ((pin) % 8))
 +
 +/* --- clock gating / pinmux bases --- */
++/*
++ * Clock gates: bit set = clock OFF, bit cleared = clock ON.
++ * (clk-gate.c: mtk_cg_is_enabled() returns mtk_cg_bit_is_cleared(); the
++ * enable path writes clr_ofs, the disable path writes set_ofs.)
++ */
 +#define INFRACFG_BASE           0x10001000u
-+#define INFRA1_CG_SET           0x88u   /* infra_imp_iic = INFRA1 bit 29 */
-+#define INFRA1_CG_STA           0x94u
++#define INFRA1_CG_SET           0x88u   /* write 1 = gate = clock OFF */
++#define INFRA1_CG_CLR           0x8Cu   /* write 1 = ungate = clock ON */
++#define INFRA1_CG_STA           0x94u   /* infra_imp_iic = INFRA1 bit 29 */
 +#define IMP_IIC_BASE            0x11017000u
-+#define IMP_CG_SET              0xE08u  /* imp_ap_i2c0 = gate bit 0 */
-+#define IMP_CG_STA              0xE00u
++#define IMP_CG_SET              0xE08u
++#define IMP_CG_CLR              0xE04u
++#define IMP_CG_STA              0xE00u  /* imp_ap_i2c0 = gate bit 0 */
 +#define TOPCK_BASE              0x10000000u
 +#define TOP_CLK_CFG_6           0xA0u   /* i2c_sel, bits 25:24 */
 +#define TOP_CLK_CFG_6_CLR       0xA8u
@@ -546,10 +553,13 @@ index 0000000..381af7f
 +static void
 +ft_clocks_on(void)
 +{
-+	uint32_t sel;
++	uint32_t sel, before1, before2;
 +
-+	ft_wr(ft.infracfg, INFRA1_CG_SET, 1u << 29);
-+	ft_wr(ft.imp, IMP_CG_SET, 1u << 0);
++	before1 = ft_rd(ft.infracfg, INFRA1_CG_STA);
++	before2 = ft_rd(ft.imp, IMP_CG_STA);
++	/* CLR = ungate.  Writing to SET would switch the clocks *off*. */
++	ft_wr(ft.infracfg, INFRA1_CG_CLR, 1u << 29);
++	ft_wr(ft.imp, IMP_CG_CLR, 1u << 0);
 +
 +	sel = (ft_rd(ft.topck, TOP_CLK_CFG_6) >> 24) & 0x3u;
 +	if (sel != 0) {
@@ -557,10 +567,10 @@ index 0000000..381af7f
 +		ft_wr(ft.topck, TOP_CLK_CFG_6_CLR, 0x3u << 24);
 +		ft_wr(ft.topck, TOP_CLK_UPDATE, 1u << 27);
 +	}
-+	printf("SWEET FLEUR TOUCH: cg infra1=0x%08x imp=0x%08x "
++	printf("SWEET FLEUR TOUCH: cg infra1 0x%08x->0x%08x imp 0x%08x->0x%08x "
 +	    "i2c_sel %u->%u\n",
-+	    ft_rd(ft.infracfg, INFRA1_CG_STA),
-+	    ft_rd(ft.imp, IMP_CG_STA), sel,
++	    before1, ft_rd(ft.infracfg, INFRA1_CG_STA),
++	    before2, ft_rd(ft.imp, IMP_CG_STA), sel,
 +	    (ft_rd(ft.topck, TOP_CLK_CFG_6) >> 24) & 0x3u);
 +}
 +

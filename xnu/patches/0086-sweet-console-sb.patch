@@ -1,0 +1,35 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..5ff86e2 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -904,6 +904,10 @@ extern int use_panic_on_proc_spawn_fail;
+ void
+ set_proc_name(struct image_params *imgp, proc_t p)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern int sweet_console_muted; /* osfmk/console/serial_console.c */
++#endif
++
+ 	int p_name_len = sizeof(p->p_name) - 1;
+ 
+ 	if (imgp->ip_ndp->ni_cnd.cn_namelen > p_name_len) {
+@@ -913,6 +917,19 @@ set_proc_name(struct image_params *imgp, proc_t p)
+ 	bcopy((caddr_t)imgp->ip_ndp->ni_cnd.cn_nameptr, (caddr_t)p->p_name,
+ 	    (unsigned)imgp->ip_ndp->ni_cnd.cn_namelen);
+ 	p->p_name[imgp->ip_ndp->ni_cnd.cn_namelen] = '\0';
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET: SpringBoard owns the screen from here on, so stop drawing
++	 * kernel text over the GUI.  Nothing is lost: sweet_log_append()
++	 * runs before the mute test, so the whole boot stays in the
++	 * persistent ring, and panic_active() still draws a panic.
++	 */
++	if (strncmp(p->p_name, "SpringBoard", sizeof("SpringBoard")) == 0 &&
++	    !sweet_console_muted) {
++		sweet_console_muted = 1;
++		printf("SWEET console: muted on SpringBoard exec\n");
++	}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ 	if (imgp->ip_ndp->ni_cnd.cn_namelen > MAXCOMLEN) {
+ 		imgp->ip_ndp->ni_cnd.cn_namelen = MAXCOMLEN;
