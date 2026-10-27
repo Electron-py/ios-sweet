@@ -160,6 +160,7 @@ The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces 
 | `tools/qemu-sweet.py` | QEMU test boots with framebuffer text decoding |
 | `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | Helpers |
 | `NOTES.md` | Detailed engineering log: every boot, crash and decision, plus hardware facts |
+| `docs/FLASHING.md` | Complete flashing instructions for **fleur** (Redmi Note 11S / MT6781): shim + root, logs, rollback |
 
 Not in git: partition backups, live device trees, recovery images, Apple firmware and root images, and downloaded or generated build trees. They contain device serials and calibration data, or Apple's copyrighted files.
 

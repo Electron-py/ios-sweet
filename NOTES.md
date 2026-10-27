@@ -46,7 +46,10 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
 - Unfinished and untouched: the 3 lost root hand-fixes (needs user `sudo`),
   wallpaper renderer.
 - Working tree clean, everything pushed to `fork` (`Electron-py/ios-sweet`,
-  branch `fleur`), HEAD `19a9601`.
+  branch `fleur`), HEAD `d6d446e`.
+- **`docs/FLASHING.md`** (2026-10-27): complete flash/rollback/log instructions
+  written for handing a shim to a second person. They will also need the root
+  image `ios16-root-20H392-v2.simg` — it is not in git.
 
 
 ### ✅ Working
