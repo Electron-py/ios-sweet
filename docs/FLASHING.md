@@ -14,7 +14,7 @@ there and may differ on another unit.
 | File | Written to | Purpose |
 | --- | --- | --- |
 | `shim-fleur-<name>.img` | `boot_b` (**or your active slot**) | Boot shim + XNU kernel + Apple device tree + boot-args, packed as an Android `boot.img` v2 |
-| `ios16-root-20H392-v2.simg` | `userdata` | One 25 GiB journaled HFS+ volume holding the iOS 16.7.16 root filesystem, cryptexes, dyld shared cache and system keybag |
+| `ios16-root-20H392-v2.img.fixed*.simg` | `userdata` | One 25 GiB journaled HFS+ volume holding the iOS 16.7.16 root filesystem, cryptexes, dyld shared cache and system keybag. Delivered as a ~11.3 GiB sparse file; the `.fixedN` suffix is just the revision it was built from |
 
 Only the first file is sent with the repo; it is **not** reproducible from git
 alone (see the appendix). The root image is a device-independent 25 GiB sparse
@@ -24,8 +24,16 @@ file and is also not in git.
 
 - A **fleur** (Redmi Note 11S, MediaTek MT6781) with an **unlocked bootloader**
 - A Linux PC with `fastboot` (Android platform-tools) and `python3`
-- `shim-fleur-*.img` and `ios16-root-20H392-v2.simg`
+- `shim-fleur-*.img` and the root image (both sent separately — neither is in
+  git)
 - Your own stock `boot.img` for the device — this is the only rollback path
+
+Known-good shim checksums (sha256), so you can confirm the transfer:
+
+```
+c8da528d6b9cdd1f83e529535c59825bd12f927697a0602ece4c486ecc55dcf9  shim-fleur-nohome.img
+c6da2eeff7153ec09c9b67edc4a65984c1d90c57489e7c0f604eaff5cc1d8b1f  shim-fleur-touchkeys7.img
+```
 
 ```sh
 fastboot oem device-info        # Xiaomi: "Device unlocked: true"
@@ -43,7 +51,8 @@ Skip this whole step if `userdata` already holds the iOS root (you are only
 updating the shim).
 
 ```sh
-fastboot -S 512M flash userdata ios16-root-20H392-v2.simg
+ROOT=/path/to/ios16-root-20H392-v2.img.fixed6.simg   # the root image you were sent
+fastboot -S 512M flash userdata "$ROOT"
 ```
 
 - Takes a while; **do not unplug**.
@@ -54,7 +63,7 @@ fastboot -S 512M flash userdata ios16-root-20H392-v2.simg
   `tools/sparse-tail.py`):
 
 ```sh
-python3 tools/sparse-tail.py ios16-root-20H392-v2.simg tail.simg
+python3 tools/sparse-tail.py "$ROOT" tail.simg
 fastboot -S 512M flash userdata tail.simg
 ```
 

@@ -49,7 +49,8 @@ Port the iOS 16.7.16 XNU userland stack to the Redmi Note 11S "fleur" (MT6781) a
   branch `fleur`), HEAD `d6d446e`.
 - **`docs/FLASHING.md`** (2026-10-27): complete flash/rollback/log instructions
   written for handing a shim to a second person. They will also need the root
-  image `ios16-root-20H392-v2.simg` — it is not in git.
+  image — `ios16-root-20H392-v2.img.fixed*.simg` (~11.3 GiB sparse, newest in
+  `~/Downloads/ipsw` is `fixed6`, 2026-10-25) — it is not in git.
 
 
 ### ✅ Working
